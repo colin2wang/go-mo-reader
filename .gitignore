@@ -1,0 +1,13 @@
+# Go Wails Build
+build/bin
+
+# Node.js
+node_modules
+frontend/dist
+
+# Wails generated checksum (decides whether frontend:install needs to re-run)
+frontend/package.json.md5
+
+# IDEs
+.idea/
+.vscode/

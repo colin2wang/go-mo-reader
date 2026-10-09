@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: true
+# pnpm >= 10.x reads project settings from here (the "pnpm" field in package.json is ignored).
+# esbuild needs its install script to place/verify the platform binary (required by vite).
