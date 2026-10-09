@@ -11,3 +11,7 @@ frontend/package.json.md5
 # IDEs
 .idea/
 .vscode/
+
+# AI Coder
+.codebuddy/
+.atomcode/

@@ -2,8 +2,9 @@
  * mr-inject.js — 墨阅 EPUB 阅读器章节注入脚本
  * 由 Go AssetServer 在返回章节 HTML 时以 <script src="/mr-inject.js" defer> 注入。
  * 职责：
- *   1) 扫描章节内 <pre>（含 <pre><code>），重建为带行号的代码块
- *   2) 自研无依赖语法高亮（19 种语言 + 类名检测 + 关键字启发式检测）
+ *   1) 扫描章节内代码块（<pre>/块级 <code>/DocBook 容器 + 语义类名 +
+ *      等宽字体或 white-space:pre 计算样式启发式），相邻代码段落自动合并
+ *   2) 自研无依赖语法高亮（19 种语言 + 类名检测 + 关键字/XML 启发式检测）
  *   3) 响应主窗口 postMessage({type:'mr-font',delta}) 进行字号调节（zoom 缩放）
  */
 (function () {
@@ -106,7 +107,8 @@
     var types = [], src = [];
     function push(type, s) { types.push(type); src.push(s); }
 
-    if (lang.preproc) push('kw', '(?m)^[ \\t]*#[a-z_]+');
+    // 注意：JS 正则不支持 (?m) 内联标志，^ 的多行语义改用正则的 m 标志实现
+    if (lang.preproc) push('kw', '^[ \\t]*#[a-z_]+');
     if (lang.bc) for (var b = 0; b < lang.bc.length; b++) {
       var pair = lang.bc[b];
       push('com', escRe(pair[0]) + '[\\s\\S]*?(?:' + escRe(pair[1]) + '|$)');
@@ -123,7 +125,7 @@
     else if (lang.num) push('num', '\\b0[xX][0-9a-fA-F_]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?[a-zA-Z]{0,3}\\b');
     push('id', '[@$]?[A-Za-z_\\u00C0-\\uFFFF][\\w$\\u00C0-\\uFFFF-]*');
 
-    var re = new RegExp('(' + src.join(')|(') + ')', 'g');
+    var re = new RegExp('(' + src.join(')|(') + ')', lang.preproc ? 'gm' : 'g');
     reCache[name] = { re: re, types: types };
     return reCache[name];
   }
@@ -153,17 +155,15 @@
     while ((m = re.exec(code))) {
       if (m.index > last) out += esc(code.slice(last, m.index));
       var txt = m[0], cls = '';
-      if (m[1] !== undefined && m[1] !== '') {
-        // 找到命中的组
-        for (var g = 1; g < m.length; g++) {
-          if (m[g] !== undefined && m[g] !== '') {
-            var t = types[g - 1];
-            if (t === 'id') {
-              var word = txt.replace(/^[@$]/, '');
-              cls = classifyIdent(word, lang, code, re.lastIndex);
-            } else cls = t;
-            break;
-          }
+      // 找到本次命中的捕获组：多分支交替下只有命中的那一个组有值
+      for (var g = 1; g < m.length; g++) {
+        if (m[g] !== undefined && m[g] !== '') {
+          var t = types[g - 1];
+          if (t === 'id') {
+            var word = txt.replace(/^[@$]/, '');
+            cls = classifyIdent(word, lang, code, re.lastIndex);
+          } else cls = t;
+          break;
         }
       }
       out += cls ? '<span class="tok-' + cls + '">' + esc(txt) + '</span>' : esc(txt);
@@ -221,6 +221,12 @@
       }
       scope = scope.parentElement; depth++;
     }
+    // XML/HTML 启发式：<?xml 声明或成对标签 → 复用 html 高亮器（Maven/ant/布局 XML 等）
+    if (/^\s*<\?xml/i.test(code) ||
+        (/<[a-zA-Z][\w:.-]*(\s[^<>]*)?>/.test(code) && /<\/[a-zA-Z][\w:.-]*\s*>/.test(code))) {
+      return 'html';
+    }
+
     // 启发式：关键字计数
     var best = null, bestScore = 0;
     for (var i = 0; i < HEUR_ORDER.length; i++) {
@@ -238,20 +244,231 @@
     return bestScore >= 3 ? best : null;
   }
 
+  /* ================= 代码块候选识别 ================= */
+
+  // 等宽字体（各 EPUB 使用的字体名并不统一）
+  var MONO_RE = /(mono|consolas|courier|menlo|monaco|andale|source\s?code\s?pro|jetbrains|dejavu sans mono)/i;
+  // 语义类名：code / code-block / programlisting / literallayout / screen / snippet ...
+  var CLASS_RE = /(^|[\s_-])(code|codeblock|codeline|programlisting|literallayout|screen|listing|snippet|sourcecode|highlight|monospace|computeroutput|literal|pre)([\s_-]|$)/i;
+  // 语义标签：HTML 原生 + DocBook 常用容器
+  var TAG_SELECTOR = 'pre,code,xmp,plaintext,programlisting,literallayout,screen,listing,computeroutput';
+  // 容器内已有更具体的代码块时，交给内层处理
+  var INNER_SELECTOR = 'pre,code,xmp,img,table,video,canvas,.mr-code';
+  // 容器内还有块级子元素（如 <div class="code"><p>…</p></div>）时同理交给内层
+  var BLOCK_KIDS = 'p,div,ul,ol,h1,h2,h3,h4,h5,h6,table';
+  var MAX_SCAN = 4000; // 单次扫描元素上限，防止超长章节拖慢渲染
+
+  function markDone(el) {
+    el.__mrdone = true;
+    var kids = el.querySelectorAll ? el.querySelectorAll('*') : [];
+    for (var i = 0; i < kids.length; i++) kids[i].__mrdone = true;
+  }
+
+  function markAllDone(run) {
+    for (var i = 0; i < run.length; i++) markDone(run[i]);
+  }
+
+  function isMonoBlock(el) {
+    var st = window.getComputedStyle(el);
+    if (!st) return false;
+    if (st.display === 'inline' || st.display === 'none') return false;
+    if (/^pre/.test(st.whiteSpace || '')) return true; // white-space:pre / pre-wrap
+    return MONO_RE.test(st.fontFamily || '');
+  }
+
+  function hasClassHint(el) {
+    var cn = (el.getAttribute && el.getAttribute('class')) || '';
+    return cn ? CLASS_RE.test(cn) : false;
+  }
+
+  // 收集候选并按"相邻兄弟"分组：逐行 <p class="code"> 会被合并成一个代码块
+  function collect() {
+    var groups = [], hits = [], used = [], i, el;
+
+    var byTag = document.querySelectorAll(TAG_SELECTOR);
+    for (i = 0; i < byTag.length; i++) {
+      el = byTag[i];
+      // 行内 <code>foo</code> 属于正文的一部分，只有块级或多行时才装饰
+      if (el.tagName === 'CODE') {
+        var cs = window.getComputedStyle(el);
+        if ((!cs || cs.display === 'inline') && el.textContent.indexOf('\n') < 0) continue;
+      }
+      groups.push([el]);
+    }
+
+    var all = document.body ? document.body.querySelectorAll('div,p,li,dd,td,blockquote,section,article') : [];
+    var limit = Math.min(all.length, MAX_SCAN);
+    for (i = 0; i < limit; i++) {
+      el = all[i];
+      if (el.__mrdone) continue;
+      if (!hasClassHint(el) && !isMonoBlock(el)) continue;
+      if (el.querySelector(INNER_SELECTOR)) continue;
+      if (el.querySelector(BLOCK_KIDS)) continue;
+      hits.push(el);
+    }
+
+    for (i = 0; i < hits.length; i++) {
+      if (used[i]) continue;
+      var run = [hits[i]];
+      used[i] = true;
+      var sib = hits[i].nextElementSibling;
+      while (sib) { // 连续的代码段落合并，行号保持连续
+        var idx = hits.indexOf(sib);
+        if (idx < 0 || used[idx]) break;
+        run.push(sib);
+        used[idx] = true;
+        sib = sib.nextElementSibling;
+      }
+      groups.push(run);
+    }
+    return groups;
+  }
+
+  /* ================= 语言工具条（逐块独立） ================= */
+
+  // 候选语言沿用 LANGS 的键 + html（走 highlightHTML），避免维护两份清单
+  var LANG_ORDER = ['python', 'javascript', 'go', 'java', 'cpp', 'csharp', 'sql', 'rust', 'php',
+    'kotlin', 'swift', 'dart', 'lua', 'ruby', 'bash', 'css', 'json', 'yaml', 'html'];
+  var LANG_LABEL = {
+    python: 'Python', javascript: 'JavaScript', go: 'Go', java: 'Java', cpp: 'C/C++', csharp: 'C#',
+    sql: 'SQL', rust: 'Rust', php: 'PHP', kotlin: 'Kotlin', swift: 'Swift', dart: 'Dart', lua: 'Lua',
+    ruby: 'Ruby', bash: 'Shell', css: 'CSS', json: 'JSON', yaml: 'YAML', html: 'HTML/XML'
+  };
+  var blockSeq = 0;            // 本章内代码块序号，用于逐块记忆的 key
+  var pendingOverrides = null; // 父窗口下发的逐块语言选择
+  var openPop = null;
+
+  function langLabel(lang) {
+    return lang ? (LANG_LABEL[lang] || lang) : '纯文本';
+  }
+
+  function blockKey(index) {
+    try { return location.pathname + '#' + index; } catch (err) { return '#' + index; }
+  }
+
+  function applyTheme(theme) {
+    var de = document.documentElement;
+    if (theme === 'dark') de.setAttribute('data-mr-code-theme', 'dark');
+    else de.removeAttribute('data-mr-code-theme');
+  }
+
+  function closeAnyPop() {
+    if (openPop) { openPop.className = 'mr-lang-pop'; openPop = null; }
+  }
+
+  function markLangItems(wrap, value) {
+    var items = wrap.querySelectorAll('.mr-lang-item');
+    for (var i = 0; i < items.length; i++) {
+      items[i].className = items[i].getAttribute('data-v') === value ? 'mr-lang-item active' : 'mr-lang-item';
+    }
+  }
+
+  // 重新高亮：只替换 code 内容，行号列不变（行数相同）
+  function applyLang(wrap, lang, manual) {
+    var codeEl = wrap.querySelector('code');
+    if (codeEl) codeEl.innerHTML = lang ? highlight(wrap.__mrSrc, lang) : esc(wrap.__mrSrc);
+    wrap.className = 'mr-code' + (lang ? ' mr-lang-' + lang : '');
+    if (wrap.__mrLabel) wrap.__mrLabel.textContent = (manual ? '' : '自动 · ') + langLabel(lang);
+    markLangItems(wrap, manual ? (lang || 'plain') : 'auto');
+  }
+
+  function buildBar(wrap, index, auto) {
+    var bar = document.createElement('div');
+    bar.className = 'mr-bar';
+
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'mr-lang-btn';
+    var name = document.createElement('span');
+    name.className = 'mr-lang-name';
+    var caret = document.createElement('span');
+    caret.className = 'mr-lang-caret';
+    caret.textContent = '▾';
+    btn.appendChild(name);
+    btn.appendChild(caret);
+    wrap.__mrLabel = name;
+
+    var pop = document.createElement('div');
+    pop.className = 'mr-lang-pop';
+
+    function addItem(label, value) {
+      var it = document.createElement('button');
+      it.type = 'button';
+      it.className = 'mr-lang-item';
+      it.textContent = label;
+      it.setAttribute('data-v', value);
+      it.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        closeAnyPop();
+        var lang = value === 'auto' ? wrap.__mrAuto : (value === 'plain' ? '' : value);
+        applyLang(wrap, lang, value !== 'auto');
+        try {
+          // 逐块选择回传主窗口持久化（key = 章节路径#块序号）
+          window.parent.postMessage({type: 'mr-lang-set', key: blockKey(index), lang: value}, '*');
+        } catch (err) { /* 忽略 */ }
+      });
+      pop.appendChild(it);
+    }
+
+    addItem('自动 · ' + langLabel(auto), 'auto');
+    addItem('纯文本', 'plain');
+    for (var i = 0; i < LANG_ORDER.length; i++) {
+      var n = LANG_ORDER[i];
+      if (n !== 'html' && !LANGS[n]) continue;
+      addItem(LANG_LABEL[n] || n, n);
+    }
+
+    btn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (openPop === pop) { closeAnyPop(); return; }
+      closeAnyPop();
+      pop.className = 'mr-lang-pop open';
+      openPop = pop;
+    });
+
+    bar.appendChild(btn);
+    bar.appendChild(pop);
+    wrap.appendChild(bar);
+    name.textContent = '自动 · ' + langLabel(auto);
+    markLangItems(wrap, 'auto');
+  }
+
+  function applyOverrides(map) {
+    var wraps = document.querySelectorAll('.mr-code');
+    for (var i = 0; i < wraps.length; i++) {
+      var w = wraps[i];
+      var v = map[blockKey(w.__mrIndex)];
+      if (v === undefined || v === null || v === 'auto') { applyLang(w, w.__mrAuto, false); continue; }
+      var lang = v === 'plain' ? '' : v;
+      if (lang && !LANGS[lang] && lang !== 'html') continue;
+      applyLang(w, lang, true);
+    }
+  }
+
+  document.addEventListener('click', closeAnyPop);
+
   /* ================= 行号装饰 ================= */
 
-  function decorate(pre) {
-    if (pre.__mrdone) return;
-    pre.__mrdone = true;
-    if (pre.querySelector('img,video,canvas,table')) return; // ASCII 图/复杂内容跳过
-    var code = pre.textContent.replace(/\r\n?/g, '\n').replace(/^\n+/, '').replace(/\s+$/, '');
-    if (!code.trim()) return;
-    if (code.indexOf('\n') < 0 && code.length < 24) return; // 极短行内代码不包装
-    var lang = detectLang(code, pre);
+  // run 为待装饰的元素数组：单个 <pre>，或合并后的连续代码段落
+  function decorate(run) {
+    var first = run[0];
+    if (!first || first.__mrdone) return false;
+
+    for (var i = 0; i < run.length; i++) {
+      // ASCII 图 / 复杂内容跳过
+      if (run[i].querySelector && run[i].querySelector('img,video,canvas,table')) { markAllDone(run); return false; }
+    }
+
+    var parts = [];
+    for (i = 0; i < run.length; i++) parts.push(run[i].textContent.replace(/\r\n?/g, '\n'));
+    var code = parts.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
+    if (!code.trim()) { markAllDone(run); return false; }
+    if (code.indexOf('\n') < 0 && code.length < 24) { markAllDone(run); return false; } // 极短行内代码不包装
+    var lang = detectLang(code, first);
     var html = highlight(code, lang || '');
     var lines = html.split('\n');
     var nums = [];
-    for (var i = 1; i <= lines.length; i++) nums.push(i);
+    for (i = 1; i <= lines.length; i++) nums.push(i);
 
     var wrap = document.createElement('div');
     wrap.className = 'mr-code' + (lang ? ' mr-lang-' + lang : '');
@@ -267,7 +484,20 @@
     body.appendChild(np);
     wrap.appendChild(ncol);
     wrap.appendChild(body);
-    pre.parentNode.replaceChild(wrap, pre);
+
+    // 保存源码、自动检测结果与块序号，供逐块切换语言时重算
+    wrap.__mrSrc = code;
+    wrap.__mrAuto = lang;
+    wrap.__mrIndex = blockSeq++;
+    buildBar(wrap, wrap.__mrIndex, lang);
+
+    // 用代码块整体替换原元素（可能是连续的多段）
+    first.parentNode.insertBefore(wrap, first);
+    for (i = 0; i < run.length; i++) {
+      markDone(run[i]);
+      if (run[i].parentNode) run[i].parentNode.removeChild(run[i]);
+    }
+    return true;
   }
 
   /* ================= 字号控制 ================= */
@@ -284,17 +514,41 @@
       document.documentElement.style.setProperty('zoom', String(zoom));
     } else if (d.type === 'mr-scroll-top') {
       window.scrollTo({ top: 0 });
+    } else if (d.type === 'mr-code-theme') {
+      applyTheme(d.theme); // 'dark' 或 'light'
+    } else if (d.type === 'mr-lang-overrides') {
+      pendingOverrides = d.map || {};
+      applyOverrides(pendingOverrides);
     }
   });
 
   /* ================= 启动 ================= */
 
   function run() {
+    var info = {groups: 0, blocks: 0};
     try {
-      var pres = document.querySelectorAll('pre');
-      for (var i = 0; i < pres.length; i++) decorate(pres[i]);
+      var groups = collect();
+      info.groups = groups.length;
+      for (var i = 0; i < groups.length; i++) {
+        try {
+          if (decorate(groups[i])) info.blocks++;
+        } catch (err) { /* 单个块失败不影响其余 */ }
+      }
+      // 主题/语言覆盖可能早于装饰完成到达，这里补应用一次
+      if (pendingOverrides) applyOverrides(pendingOverrides);
     } catch (err) { /* 保证不破坏章节渲染 */ }
+    try {
+      window.__mrInfo = info; // 便于在 devtools 里排查：iframe.contentWindow.__mrInfo
+      if (window.parent && window.parent.__MR_DEBUG) console.log('[mr-inject]', info);
+    } catch (err) { /* 忽略 */ }
   }
+  // 调试钩子：可在 devtools 控制台直接验证着色输出，例如
+  // window.__mrHighlight('public class A {}', 'java')
+  try {
+    window.__mrHighlight = highlight;
+    window.__mrDetectLang = detectLang;
+  } catch (err) { /* 忽略 */ }
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', run);
   } else {

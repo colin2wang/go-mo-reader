@@ -18,6 +18,8 @@ const dragging = ref(false)
 const toast = ref('')
 const iframeEl = ref<HTMLIFrameElement | null>(null)
 const fontZoom = ref(1)
+const codeTheme = ref<'light' | 'dark'>('light') // 代码块主题（全局开关）
+const codeLang = ref<Record<string, string>>({}) // 逐块语言选择：key = 章节路径#块序号
 
 const chapterURL = computed(() => {
   const b = book.value
@@ -136,8 +138,10 @@ function onKeydown(e: KeyboardEvent) {
 // 新 iframe 加载完成后同步当前缩放并回到顶部
 function onIframeLoad() {
   bindIframeDrop()
-  iframeEl.value?.contentWindow?.postMessage(
-    {type: 'mr-font', set: fontZoom.value}, '*')
+  postToIframe({type: 'mr-font', set: fontZoom.value})
+  // 切章后向新 iframe 重新下发主题与本章已保存的逐块语言选择
+  postToIframe({type: 'mr-code-theme', theme: codeTheme.value})
+  postToIframe({type: 'mr-lang-overrides', map: codeLang.value})
   scrollTop()
 }
 function changeFont(delta: number) {
@@ -146,12 +150,42 @@ function changeFont(delta: number) {
     {type: 'mr-font', delta}, '*')
 }
 
+/* ---------------- 代码块主题与语言 ---------------- */
+function postToIframe(msg: Record<string, unknown>) {
+  iframeEl.value?.contentWindow?.postMessage(msg, '*')
+}
+
+function toggleCodeTheme() {
+  codeTheme.value = codeTheme.value === 'dark' ? 'light' : 'dark'
+  try {
+    localStorage.setItem('mr-code-theme', codeTheme.value)
+  } catch { /* 忽略：异常时退化为内存态 */ }
+  postToIframe({type: 'mr-code-theme', theme: codeTheme.value})
+}
+
+// iframe 内逐块切换语言后回传，按"章节路径#块序号"持久化
+function onChildMessage(e: MessageEvent) {
+  const d = e.data as {type?: string; key?: string; lang?: string} | null
+  if (!d || d.type !== 'mr-lang-set' || !d.key) return
+  codeLang.value = {...codeLang.value, [d.key]: d.lang ?? 'auto'}
+  try {
+    localStorage.setItem('mr-code-lang', JSON.stringify(codeLang.value))
+  } catch { /* 忽略 */ }
+}
+
 /* ---------------- 生命周期 ---------------- */
 onMounted(async () => {
   window.addEventListener('dragover', onDragOver)
   window.addEventListener('dragleave', onDragLeave)
   window.addEventListener('drop', onDOMDrop)
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('message', onChildMessage)
+  try {
+    // 代码块主题（全局）与逐块语言选择：localStorage 恢复，读失败退化为默认
+    const t = localStorage.getItem('mr-code-theme')
+    if (t === 'dark' || t === 'light') codeTheme.value = t
+    codeLang.value = JSON.parse(localStorage.getItem('mr-code-lang') || '{}')
+  } catch { /* 忽略 */ }
   // useDropTarget=false：为 true 时 Wails 会校验落点元素是否带
   // `--wails-drop-target: drop` 样式，不满足就静默丢弃回调（本项目未定义该 CSS 变量）
   OnFileDrop(onWailsDrop, false)
@@ -167,6 +201,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragleave', onDragLeave)
   window.removeEventListener('drop', onDOMDrop)
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('message', onChildMessage)
 })
 </script>
 
@@ -198,6 +233,11 @@ onBeforeUnmount(() => {
         <button class="icon-btn" title="缩小字号" @click="changeFont(-0.1)">A-</button>
         <button class="icon-btn" title="放大字号" @click="changeFont(0.1)">A+</button>
       </div>
+      <button
+        class="icon-btn"
+        :title="codeTheme === 'dark' ? '代码块：深色（点击切浅色）' : '代码块：浅色（点击切深色）'"
+        @click="toggleCodeTheme"
+      >{{ codeTheme === 'dark' ? '☀' : '🌙' }}</button>
       <button class="icon-btn" title="上一章 (←)" :disabled="current <= 0" @click="prev">‹</button>
       <span class="chapter-pos">{{ current + 1 }} / {{ book.chapters.length }}</span>
       <button class="icon-btn" title="下一章 (→)" :disabled="current >= book.chapters.length - 1" @click="next">›</button>
