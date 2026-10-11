@@ -103,10 +103,22 @@ func TestHandlerEndToEnd(t *testing.T) {
 		t.Errorf("image: code=%d ct=%q", r.Code, r.Header().Get("Content-Type"))
 	}
 
-	// 注入脚本
+	// 注入脚本：章节 DOM 逻辑
 	r = get(t, lib, "/mr-inject.js")
 	if r.Code != 200 || !strings.Contains(r.Body.String(), "mr-code") {
 		t.Error("inject.js not served")
+	}
+
+	// 注入脚本：兜底高亮引擎
+	r = get(t, lib, "/mr-highlight.js")
+	if r.Code != 200 || !strings.Contains(r.Body.String(), "__mrHL") {
+		t.Error("highlight.js fallback not served")
+	}
+
+	// highlight.js 构建产物：未构建时允许 404（章节会回退到内置引擎），但不能 5xx
+	r = get(t, lib, "/mr-vendor/highlight.js")
+	if r.Code != 200 && r.Code != 404 {
+		t.Errorf("vendor highlight.js: code=%d", r.Code)
 	}
 
 	// 未注册书籍 / 不存在文件 / 路径穿越
@@ -142,5 +154,37 @@ func TestPrepareHTMLOutput(t *testing.T) {
 	out = string(prepareHTML([]byte(`<?xml version="1.0"?><html><head></head><body>ok</body></html>`)))
 	if strings.Contains(out, "<?xml") {
 		t.Error("xml decl kept")
+	}
+	// 注入顺序：阅读器样式 → highlight.js → 兜底引擎 → 章节脚本
+	pos := []int{
+		strings.Index(out, "mr-reader-css"),
+		strings.Index(out, `/mr-vendor/highlight.js`),
+		strings.Index(out, `/mr-highlight.js`),
+		strings.Index(out, `/mr-inject.js`),
+	}
+	for i := 0; i < len(pos); i++ {
+		if pos[i] < 0 {
+			t.Fatalf("inject item %d missing", i)
+		}
+		if i > 0 && pos[i] < pos[i-1] {
+			t.Errorf("inject order wrong: %v", pos)
+		}
+	}
+}
+
+// 统一排版样式必须覆盖字体/颜色/间距，并提供双主题变量，
+// 否则原书 CSS 与内联 style 会继续生效。
+func TestReaderCSSCoversUnifiedStyle(t *testing.T) {
+	need := []string{
+		"--mr-bg", "--mr-ink", "--mr-body-fs", "--mr-code-fs", "--mr-lh", "--mr-width",
+		`html[data-mr-theme="dark"]`,
+		"font-family:var(--mr-font)!important",
+		"float:none!important",
+		".mr-code", ".mr-nums", ".mr-bar", ".hljs-keyword",
+	}
+	for _, s := range need {
+		if !strings.Contains(readerCSS, s) {
+			t.Errorf("readerCSS missing %q", s)
+		}
 	}
 }

@@ -9,3 +9,5 @@ export function GetStartupFile():Promise<string>;
 export function OpenFileDialog():Promise<string>;
 
 export function OpenPath(arg1:string):Promise<epub.Book>;
+
+export function SetTheme(arg1:boolean):Promise<void>;

@@ -54,8 +54,9 @@ if ($Clean) {
 
 Write-Host '==> Installing frontend dependencies (pnpm install)...' -ForegroundColor Cyan
 Push-Location "$Root\frontend"
-# --frozen-lockfile keeps node_modules in sync with pnpm-lock.yaml (CI-safe)
-pnpm install --frozen-lockfile
+# --no-frozen-lockfile：package.json 变更后允许刷新 pnpm-lock.yaml
+# （锁定依赖稳定后再改回 --frozen-lockfile 即可）
+pnpm install --no-frozen-lockfile
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit 1 }
 Pop-Location
 

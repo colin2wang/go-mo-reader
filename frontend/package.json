@@ -4,8 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "dev": "vite build --config vite.inject.config.ts && vite",
+    "build": "vue-tsc --noEmit && vite build && vite build --config vite.inject.config.ts",
+    "build:inject": "vite build --config vite.inject.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "typescript": "^4.6.4",
     "vite": "^3.0.7",
     "vue-tsc": "^1.8.27",
-    "@babel/types": "^7.18.10"
+    "@babel/types": "^7.18.10",
+    "highlight.js": "^11.11.1"
   }
 }

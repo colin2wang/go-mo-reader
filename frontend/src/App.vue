@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import {computed, onBeforeUnmount, onMounted, ref} from 'vue'
+import {computed, onBeforeUnmount, onMounted, ref, watch} from 'vue'
 import TocDrawer from './components/TocDrawer.vue'
+import ContextMenu from './components/ContextMenu.vue'
+import SettingsDialog from './components/SettingsDialog.vue'
+import ImageViewer from './components/ImageViewer.vue'
 import {
   CloseBook,
   GetStartupFile,
@@ -9,6 +12,21 @@ import {
 } from '../wailsjs/go/main/App'
 import {OnFileDrop} from '../wailsjs/runtime/runtime'
 import {epub} from '../wailsjs/go/models'
+import {
+  BLOCK_KEY,
+  LANG_KEY,
+  DEFAULT_SETTINGS,
+  loadSettings,
+  loadStringMap,
+  saveSettings,
+  saveStringMap,
+  type BlockOverride,
+  type LangOverride,
+  type ReaderSettings,
+  type Theme,
+} from './settings'
+import {parseFromIframe, postToIframe, type CodeContext, type ImageContext} from './bridge'
+import {buildMenu, type MenuContext, type MenuItem} from './menu'
 
 /* ---------------- 状态 ---------------- */
 const book = ref<epub.Book | null>(null)
@@ -17,9 +35,22 @@ const showToc = ref(false)
 const dragging = ref(false)
 const toast = ref('')
 const iframeEl = ref<HTMLIFrameElement | null>(null)
-const fontZoom = ref(1)
-const codeTheme = ref<'light' | 'dark'>('light') // 代码块主题（全局开关）
-const codeLang = ref<Record<string, string>>({}) // 逐块语言选择：key = 章节路径#块序号
+const settings = ref<ReaderSettings>(loadSettings())
+const showSettings = ref(false)
+
+// 逐块选择：语言覆盖、代码块纠正（取消 / 强制标记）
+const langOverrides = ref<Record<string, LangOverride>>(loadStringMap(LANG_KEY))
+const blockOverrides = ref<Record<string, BlockOverride>>(
+  loadStringMap(BLOCK_KEY) as Record<string, BlockOverride>,
+)
+
+// 右键菜单
+const menuPos = ref<{x: number; y: number} | null>(null)
+const menuItems = ref<MenuItem[]>([])
+const menuCtx = ref<MenuContext | null>(null)
+
+// 图片查看
+const viewer = ref<ImageContext | null>(null)
 
 const chapterURL = computed(() => {
   const b = book.value
@@ -28,11 +59,55 @@ const chapterURL = computed(() => {
   return ch ? `/epub/${b.id}/${encodeURI(ch.path)}` : ''
 })
 
+const canPrev = computed(() => !!book.value && current.value > 0)
+const canNext = computed(() => !!book.value && current.value < book.value.chapters.length - 1)
+
 let toastTimer = 0
 function showToast(msg: string) {
   toast.value = msg
   window.clearTimeout(toastTimer)
   toastTimer = window.setTimeout(() => (toast.value = ''), 2600)
+}
+
+/* ---------------- 设置与主题 ---------------- */
+
+function applyThemeToWindow(theme: Theme) {
+  document.documentElement.setAttribute('data-theme', theme)
+  // 同步原生窗口标题栏（wails 重新生成绑定后才存在，未生成时静默跳过）
+  try {
+    const app = (window as any)?.go?.main?.App
+    if (app && typeof app.SetTheme === 'function') app.SetTheme(theme === 'dark')
+  } catch {
+    /* 忽略 */
+  }
+}
+
+watch(
+  () => settings.value.theme,
+  (t) => {
+    applyThemeToWindow(t)
+    postToIframe(iframeEl.value?.contentWindow, {type: 'mr-theme', theme: t})
+  },
+  {immediate: true},
+)
+
+function pushSettings() {
+  saveSettings(settings.value)
+  postToIframe(iframeEl.value?.contentWindow, {type: 'mr-settings', settings: settings.value})
+}
+
+// 设置变更即时下发到章节（字号/行高/页宽/缩进等）
+watch(settings, pushSettings, {deep: true})
+
+function toggleTheme() {
+  settings.value = {...settings.value, theme: settings.value.theme === 'dark' ? 'light' : 'dark'}
+}
+
+function setFontSize(px: number) {
+  settings.value = {
+    ...settings.value,
+    fontSize: Math.min(24, Math.max(14, Math.round(px))),
+  }
 }
 
 /* ---------------- 打开流程 ---------------- */
@@ -43,7 +118,6 @@ async function openFile(path: string) {
     if (book.value) await CloseBook(book.value.id)
     book.value = b
     current.value = 0
-    fontZoom.value = 1
   } catch (e: any) {
     showToast('打开失败：' + String(e?.message ?? e))
   }
@@ -120,57 +194,223 @@ const prev = () => jumpTo(current.value - 1)
 const next = () => jumpTo(current.value + 1)
 
 function scrollTop() {
-  iframeEl.value?.contentWindow?.postMessage({type: 'mr-scroll-top'}, '*')
+  postToIframe(iframeEl.value?.contentWindow, {type: 'mr-scroll-top'})
 }
 
+/* ---------------- iframe 生命周期 ---------------- */
+function onIframeLoad() {
+  bindIframeDrop()
+  const win = iframeEl.value?.contentWindow
+  postToIframe(win, {type: 'mr-theme', theme: settings.value.theme})
+  postToIframe(win, {type: 'mr-settings', settings: settings.value})
+  postToIframe(win, {type: 'mr-lang-overrides', map: langOverrides.value})
+  postToIframe(win, {type: 'mr-block-overrides', map: blockOverrides.value})
+  scrollTop()
+}
+
+/* ---------------- 复制 ---------------- */
+function fallbackCopy(text: string) {
+  if (!text) return
+  const done = () => showToast('已复制')
+  try {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done, () => showToast('复制失败'))
+      return
+    }
+  } catch {
+    /* 落到 execCommand */
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.left = '-9999px'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    showToast(ok ? '已复制' : '复制失败')
+  } catch {
+    showToast('复制失败')
+  }
+}
+
+async function copyImage(src: string) {
+  try {
+    const res = await fetch(src)
+    const blob = await res.blob()
+    // ClipboardItem 在部分 WebView2 / TS lib 版本里不可用，按需取用并做能力检测
+    const CI = (window as any).ClipboardItem
+    const clip = navigator.clipboard as any
+    if (typeof CI === 'undefined' || !clip?.write) throw new Error('unsupported')
+    await clip.write([new CI({[blob.type || 'image/png']: blob})])
+    showToast('图片已复制')
+  } catch {
+    showToast('当前环境不支持复制图片，可改用「查看原图」')
+  }
+}
+
+/* ---------------- 右键菜单 ---------------- */
+function openMenu(msg: {x: number; y: number; selection: string; code: CodeContext | null; image: ImageContext | null; inCode: boolean}) {
+  const rect = iframeEl.value?.getBoundingClientRect()
+  const baseX = rect ? rect.left : 0
+  const baseY = rect ? rect.top : 0
+  const ctx: MenuContext = {
+    selection: msg.selection,
+    code: msg.code,
+    image: msg.image,
+    inCode: msg.inCode,
+    canPrev: canPrev.value,
+    canNext: canNext.value,
+    settings: settings.value,
+  }
+  menuCtx.value = ctx
+  menuItems.value = buildMenu(ctx)
+  // iframe 内 clientX/Y 与主窗口像素 1:1（未使用 zoom 缩放）
+  menuPos.value = {x: baseX + msg.x, y: baseY + msg.y}
+}
+
+function closeMenu() {
+  menuPos.value = null
+  menuCtx.value = null
+}
+
+function onMenuSelect(id: string, value?: string) {
+  const ctx = menuCtx.value
+  const win = iframeEl.value?.contentWindow
+  switch (id) {
+    case 'copy':
+      postToIframe(win, {type: 'mr-copy'})
+      break
+    case 'select-all':
+      postToIframe(win, {type: 'mr-select-all'})
+      break
+    case 'copy-code':
+      if (ctx?.code) postToIframe(win, {type: 'mr-copy-code', index: ctx.code.index})
+      break
+    case 'lang':
+      if (ctx?.code && value) {
+        postToIframe(win, {type: 'mr-code-action', index: ctx.code.index, action: 'lang', value})
+      }
+      break
+    case 'numbers':
+      if (ctx?.code) postToIframe(win, {type: 'mr-code-action', index: ctx.code.index, action: 'numbers'})
+      break
+    case 'collapse':
+      if (ctx?.code) postToIframe(win, {type: 'mr-code-action', index: ctx.code.index, action: 'collapse'})
+      break
+    case 'expand':
+      if (ctx?.code) postToIframe(win, {type: 'mr-code-action', index: ctx.code.index, action: 'expand'})
+      break
+    case 'reject':
+      if (ctx?.code) postToIframe(win, {type: 'mr-code-action', index: ctx.code.index, action: 'reject'})
+      break
+    case 'mark-code':
+      postToIframe(win, {type: 'mr-mark-code'})
+      break
+    case 'font-dec':
+      setFontSize(settings.value.fontSize - 1)
+      break
+    case 'font-inc':
+      setFontSize(settings.value.fontSize + 1)
+      break
+    case 'font-reset':
+      setFontSize(DEFAULT_SETTINGS.fontSize)
+      break
+    case 'theme':
+      toggleTheme()
+      break
+    case 'prev':
+      prev()
+      break
+    case 'next':
+      next()
+      break
+    case 'toc':
+      showToc.value = true
+      break
+    case 'view-image':
+      if (ctx?.image) viewer.value = ctx.image
+      break
+    case 'copy-image':
+      if (ctx?.image) copyImage(ctx.image.src)
+      break
+    case 'settings':
+      showSettings.value = true
+      break
+    default:
+      break
+  }
+  closeMenu()
+}
+
+/* ---------------- 来自 iframe 的消息 ---------------- */
+function onChildMessage(e: MessageEvent) {
+  const d = parseFromIframe(e.data)
+  if (!d) return
+  switch (d.type) {
+    case 'mr-lang-set':
+      langOverrides.value = {...langOverrides.value, [d.key]: d.lang}
+      saveStringMap(LANG_KEY, langOverrides.value)
+      break
+    case 'mr-block-set':
+      blockOverrides.value = {...blockOverrides.value, [d.key]: d.value}
+      saveStringMap(BLOCK_KEY, blockOverrides.value)
+      break
+    case 'mr-clipboard':
+      if (!d.ok) fallbackCopy(d.text)
+      else showToast('已复制')
+      break
+    case 'mr-context':
+      openMenu(d)
+      break
+    default:
+      break
+  }
+}
+
+/* ---------------- 键盘 ---------------- */
 function onKeydown(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
     e.preventDefault()
     selectFile()
     return
   }
-  if (!book.value) return
+  if (e.key === 'Escape') {
+    if (viewer.value) viewer.value = null
+    else if (menuPos.value) closeMenu()
+    else if (showSettings.value) showSettings.value = false
+    else if (showToc.value) showToc.value = false
+    return
+  }
+  if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) {
+    e.preventDefault()
+    setFontSize(settings.value.fontSize + 1)
+    return
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === '-') {
+    e.preventDefault()
+    setFontSize(settings.value.fontSize - 1)
+    return
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === '0') {
+    e.preventDefault()
+    setFontSize(DEFAULT_SETTINGS.fontSize)
+    return
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
+    e.preventDefault()
+    toggleTheme()
+    return
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+    e.preventDefault()
+    showToc.value = !showToc.value
+    return
+  }
+  if (!book.value || menuPos.value || showSettings.value) return
   if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()
-}
-
-/* ---------------- 字号调节 ---------------- */
-// 新 iframe 加载完成后同步当前缩放并回到顶部
-function onIframeLoad() {
-  bindIframeDrop()
-  postToIframe({type: 'mr-font', set: fontZoom.value})
-  // 切章后向新 iframe 重新下发主题与本章已保存的逐块语言选择
-  postToIframe({type: 'mr-code-theme', theme: codeTheme.value})
-  postToIframe({type: 'mr-lang-overrides', map: codeLang.value})
-  scrollTop()
-}
-function changeFont(delta: number) {
-  fontZoom.value = Math.min(2, Math.max(0.6, fontZoom.value + delta))
-  iframeEl.value?.contentWindow?.postMessage(
-    {type: 'mr-font', delta}, '*')
-}
-
-/* ---------------- 代码块主题与语言 ---------------- */
-function postToIframe(msg: Record<string, unknown>) {
-  iframeEl.value?.contentWindow?.postMessage(msg, '*')
-}
-
-function toggleCodeTheme() {
-  codeTheme.value = codeTheme.value === 'dark' ? 'light' : 'dark'
-  try {
-    localStorage.setItem('mr-code-theme', codeTheme.value)
-  } catch { /* 忽略：异常时退化为内存态 */ }
-  postToIframe({type: 'mr-code-theme', theme: codeTheme.value})
-}
-
-// iframe 内逐块切换语言后回传，按"章节路径#块序号"持久化
-function onChildMessage(e: MessageEvent) {
-  const d = e.data as {type?: string; key?: string; lang?: string} | null
-  if (!d || d.type !== 'mr-lang-set' || !d.key) return
-  codeLang.value = {...codeLang.value, [d.key]: d.lang ?? 'auto'}
-  try {
-    localStorage.setItem('mr-code-lang', JSON.stringify(codeLang.value))
-  } catch { /* 忽略 */ }
 }
 
 /* ---------------- 生命周期 ---------------- */
@@ -180,12 +420,7 @@ onMounted(async () => {
   window.addEventListener('drop', onDOMDrop)
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('message', onChildMessage)
-  try {
-    // 代码块主题（全局）与逐块语言选择：localStorage 恢复，读失败退化为默认
-    const t = localStorage.getItem('mr-code-theme')
-    if (t === 'dark' || t === 'light') codeTheme.value = t
-    codeLang.value = JSON.parse(localStorage.getItem('mr-code-lang') || '{}')
-  } catch { /* 忽略 */ }
+  applyThemeToWindow(settings.value.theme)
   // useDropTarget=false：为 true 时 Wails 会校验落点元素是否带
   // `--wails-drop-target: drop` 样式，不满足就静默丢弃回调（本项目未定义该 CSS 变量）
   OnFileDrop(onWailsDrop, false)
@@ -216,31 +451,33 @@ onBeforeUnmount(() => {
       <div class="hint-list">
         <div><b>拖拽打开</b> · 将 EPUB 文件拖入本窗口</div>
         <div><b>发送到打开</b> · 右键 EPUB → 发送到 → 墨阅 MoRead</div>
-        <div><b>代码阅读</b> · 自动语法高亮 + 行号显示</div>
+        <div><b>代码阅读</b> · 语法高亮 + 行号 + 逐块切换语言</div>
+        <div><b>右键菜单</b> · 复制、代码块操作、字号、主题与设置</div>
       </div>
     </div>
   </div>
 
   <template v-else>
     <header class="topbar">
-      <button class="icon-btn" title="目录 (☰)" @click="showToc = true">☰</button>
+      <button class="icon-btn" title="目录 (Ctrl+B)" @click="showToc = true">☰</button>
       <button class="icon-btn" title="打开文件 (Ctrl+O)" @click="selectFile">📂</button>
       <div class="book-meta">
         <span class="book-title" :title="book.title">{{ book.title }}</span>
         <span class="book-author" v-if="book.author">{{ book.author }}</span>
       </div>
       <div class="font-group">
-        <button class="icon-btn" title="缩小字号" @click="changeFont(-0.1)">A-</button>
-        <button class="icon-btn" title="放大字号" @click="changeFont(0.1)">A+</button>
+        <button class="icon-btn" title="缩小字号 (Ctrl+-)" @click="setFontSize(settings.fontSize - 1)">A-</button>
+        <button class="icon-btn" title="放大字号 (Ctrl+=)" @click="setFontSize(settings.fontSize + 1)">A+</button>
       </div>
       <button
         class="icon-btn"
-        :title="codeTheme === 'dark' ? '代码块：深色（点击切浅色）' : '代码块：浅色（点击切深色）'"
-        @click="toggleCodeTheme"
-      >{{ codeTheme === 'dark' ? '☀' : '🌙' }}</button>
-      <button class="icon-btn" title="上一章 (←)" :disabled="current <= 0" @click="prev">‹</button>
+        :title="settings.theme === 'dark' ? '夜间模式（点击切白天，Ctrl+D）' : '白天模式（点击切夜间，Ctrl+D）'"
+        @click="toggleTheme"
+      >{{ settings.theme === 'dark' ? '☀' : '🌙' }}</button>
+      <button class="icon-btn" title="设置" @click="showSettings = true">⚙</button>
+      <button class="icon-btn" title="上一章 (←)" :disabled="!canPrev" @click="prev">‹</button>
       <span class="chapter-pos">{{ current + 1 }} / {{ book.chapters.length }}</span>
-      <button class="icon-btn" title="下一章 (→)" :disabled="current >= book.chapters.length - 1" @click="next">›</button>
+      <button class="icon-btn" title="下一章 (→)" :disabled="!canNext" @click="next">›</button>
     </header>
 
     <main class="reader-area">
@@ -262,6 +499,31 @@ onBeforeUnmount(() => {
       @close="showToc = false"
     />
   </template>
+
+  <!-- 右键菜单 -->
+  <ContextMenu
+    v-if="menuPos"
+    :x="menuPos.x"
+    :y="menuPos.y"
+    :items="menuItems"
+    @select="onMenuSelect"
+    @close="closeMenu"
+  />
+
+  <!-- 设置 -->
+  <SettingsDialog
+    v-if="showSettings"
+    v-model="settings"
+    @close="showSettings = false"
+  />
+
+  <!-- 图片查看 -->
+  <ImageViewer
+    v-if="viewer"
+    :src="viewer.src"
+    :alt="viewer.alt"
+    @close="viewer = null"
+  />
 
   <!-- 拖放遮罩 -->
   <div v-if="dragging" class="drop-mask">

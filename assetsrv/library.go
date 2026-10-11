@@ -11,10 +11,14 @@ import (
 	"MoRead/epub"
 )
 
+// maxBooks 同时保留的书籍上限
+const maxBooks = 3
+
 // Library 全局书籍库（本应用为单文件阅读器，通常同一时刻 1 本）
 type Library struct {
 	mu    sync.RWMutex
 	books map[string]*epub.Book
+	order []string // 打开顺序，末尾为最近使用
 }
 
 func NewLibrary() *Library {
@@ -28,23 +32,47 @@ func (l *Library) Open(diskPath string) (*epub.Book, error) {
 		return nil, err
 	}
 	l.mu.Lock()
-	// 简单 LRU：最多同时保留 3 本，超出时淘汰最早的一本
-	if len(l.books) >= 3 {
-		for k := range l.books {
-			delete(l.books, k)
-			break
+	// 简单 LRU：超出上限时淘汰最久未打开的一本。
+	// 注意必须按 order 淘汰而不是随机挑一个，否则可能把当前正在阅读的书挤掉，
+	// 导致章节里的图片/CSS 全部 404。
+	if _, exists := l.books[b.ID]; !exists && len(l.books) >= maxBooks {
+		for len(l.books) >= maxBooks && len(l.order) > 0 {
+			victim := l.order[0]
+			l.order = l.order[1:]
+			if victim == b.ID {
+				continue
+			}
+			if _, ok := l.books[victim]; ok {
+				delete(l.books, victim)
+				break
+			}
 		}
 	}
+	l.touchLocked(b.ID)
 	l.books[b.ID] = b
 	l.mu.Unlock()
 	return b, nil
 }
 
-// Get 按 ID 取书
+// touchLocked 把 id 移到使用顺序末尾（调用方需持有写锁）
+func (l *Library) touchLocked(id string) {
+	for i := 0; i < len(l.order); i++ {
+		if l.order[i] == id {
+			l.order = append(l.order[:i], l.order[i+1:]...)
+			break
+		}
+	}
+	l.order = append(l.order, id)
+}
+
+// Get 按 ID 取书，并把它记为最近使用（避免被后续打开的书挤掉）
 func (l *Library) Get(id string) (*epub.Book, bool) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	b, ok := l.books[id]
+	if ok {
+		l.touchLocked(id)
+	}
 	return b, ok
 }
 
@@ -52,6 +80,12 @@ func (l *Library) Get(id string) (*epub.Book, bool) {
 func (l *Library) Close(id string) {
 	l.mu.Lock()
 	delete(l.books, id)
+	for i := 0; i < len(l.order); i++ {
+		if l.order[i] == id {
+			l.order = append(l.order[:i], l.order[i+1:]...)
+			break
+		}
+	}
 	l.mu.Unlock()
 }
 

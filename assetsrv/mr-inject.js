@@ -1,273 +1,172 @@
 /*
  * mr-inject.js — 墨阅 EPUB 阅读器章节注入脚本
- * 由 Go AssetServer 在返回章节 HTML 时以 <script src="/mr-inject.js" defer> 注入。
+ * 由 Go AssetServer 以 <script src="/mr-inject.js" defer> 注入章节。
+ * 依赖：window.__mrHL（mr-highlight.js，语言判别与兜底着色）、
+ *       window.hljs（可选，highlight.js 构建产物，缺失时自动降级）。
+ *
  * 职责：
- *   1) 扫描章节内代码块（<pre>/块级 <code>/DocBook 容器 + 语义类名 +
- *      等宽字体或 white-space:pre 计算样式启发式），相邻代码段落自动合并
- *   2) 自研无依赖语法高亮（19 种语言 + 类名检测 + 关键字/XML 启发式检测）
- *   3) 响应主窗口 postMessage({type:'mr-font',delta}) 进行字号调节（zoom 缩放）
+ *   1) 剥离原书样式（link/style/style 属性/表现属性），统一排版；可整体开关与还原
+ *   2) 代码块候选识别：多维置信度打分（消除「正文被误判成代码」），相邻代码段落合并
+ *   3) 代码块装饰：行号、语言工具条、复制、折叠，逐块语言可切换并回传主窗口持久化
+ *   4) 应用主窗口下发的主题与设置（字号/行高/页宽/缩进/对齐/代码字号…）
+ *   5) 右键上下文上报与指令执行（复制、全选、复制代码、改语言、折叠、取消代码块…）
  */
 (function () {
   'use strict';
 
-  /* ================= 语言定义 ================= */
+  var HL = window.__mrHL || {};
 
-  function L(kw, opt) {
-    opt = opt || {};
-    return {
-      kw: kw,
-      lc: opt.lc || null,      // 行注释前缀
-      bc: opt.bc || null,      // 块注释 [start,end]
-      str: opt.str || null,    // 单行字符串引号
-      mstr: opt.mstr || null,  // 可跨行字符串引号（非贪婪）
-      num: opt.num !== false,  // 数字
-      preproc: !!opt.preproc,  // 行首 # 预处理
-      css: !!opt.css,          // CSS 特化（hex 颜色 / 单位）
-      builtins: opt.bi || null
-    };
-  }
+  /* ================= 常量 ================= */
 
-  var JS_KW = 'var let const function class if else for while do return new this typeof instanceof in of import export from default async await try catch finally throw switch case break continue null undefined true false extends super static get set yield delete void interface type enum implements namespace declare readonly public private protected as satisfies keyof infer is abstract override';
-  var PY_KW = 'and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield True False None match case';
-  var GO_KW = 'package import func var const type struct interface map chan go defer select switch case if else for range return break continue fallthrough nil true false iota goto';
-  var JAVA_KW = 'public private protected class interface extends implements static final void int long double float boolean char byte short new return if else for while do switch case break continue default try catch finally throw throws import package this super null true false abstract synchronized volatile transient enum record var sealed permits instanceof';
-  var C_KW = 'auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while class new delete this template typename namespace using public private protected virtual override final try catch throw operator explicit constexpr nullptr NULL true false mutable noexcept concept requires co_await co_return';
-  var CS_KW = 'public private protected internal class struct interface record enum static readonly const void int long double float bool char byte short decimal object string new return if else for foreach while do switch case break continue default try catch finally throw using namespace this base null true false abstract virtual override sealed async await var dynamic is as in out ref params get set yield lock event delegate volatile checked unchecked nameof typeof';
-  var SQL_KW = 'select from where insert into values update set delete create table drop alter add column primary key foreign references index view distinct union all group by order having limit offset join left right inner outer full cross on as and or not null is like in between exists case when then else end asc desc count sum avg min max begin commit rollback transaction with recursive default check unique constraint';
-  var RUST_KW = 'fn let mut const static struct enum impl trait pub use mod match if else for while loop return break continue self Self crate super where async await move ref dyn box unsafe as in true false type extern macro dyn';
-  var PHP_KW = 'function class interface trait extends implements public private protected static final abstract echo print return if else elseif foreach for while do switch case break continue default new clone try catch finally throw namespace use as null true false global list match enum readonly instanceof';
-  var KT_KW = 'fun val var class object interface data sealed enum companion init constructor if else for while do when return break continue import package as is in null true false this super private public internal protected open override final abstract lateinit suspend inline reified operator infix const by lazy where typealias';
-  var SWIFT_KW = 'func let var class struct enum protocol extension if else for while repeat switch case return break continue import struct deinit init self super nil true false guard defer do try catch throw throws async await where in as is some any actor static public private internal open final override lazy weak unowned mutating subscript typealias associatedtype';
-  var DART_KW = 'var final const void int double num bool String List Map Set dynamic if else for while do switch case return break continue import library part of class extends implements with mixin abstract interface enum new this super null true false async await yield late required is as in get set static final covariant factory operator typedef Future Stream';
-  var LUA_KW = 'and break do else elseif end false for function goto if in local nil not or repeat return then true until while self';
-  var RUBY_KW = 'def end class module if elsif else unless case when while until for in do then begin rescue ensure raise return yield self nil true false and or not require require_relative attr_accessor attr_reader attr_writer puts lambda proc new super private public protected';
-  var BASH_KW = 'if then else elif fi for while until do done case esac function in select time coproc return exit break continue local export readonly declare unset shift trap eval exec source alias set echo read cd pushd printf test';
+  // 等宽字体（各 EPUB 使用的字体名并不统一）
+  var MONO_RE = /(mono|consolas|courier|menlo|monaco|andale|source\s?code\s?pro|jetbrains|dejavu sans mono)/i;
+  // 语义类名：code / code-block / programlisting / literallayout / screen / snippet …
+  var CLASS_RE = /(^|[\s_-])(code|codeblock|codeline|programlisting|literallayout|screen|listing|snippet|sourcecode|highlight|monospace|computeroutput|literal|pre)([\s_-]|$)/i;
+  // 显式语言类名：language-go / lang-python / brush: java
+  var LANG_CLASS_RE = /(?:^|[\s_-])(?:language|lang|highlight|syntax|brush)[\s:_-]*([\w+#-]+)/i;
+  // 语义标签：HTML 原生 + DocBook 常用容器
+  var TAG_SELECTOR = 'pre,code,xmp,plaintext,programlisting,literallayout,screen,listing,computeroutput';
+  // 容器内已有更具体的代码块时，交给内层处理
+  var INNER_SELECTOR = 'pre,code,xmp,img,table,video,canvas,svg,.mr-code';
+  // 容器内还有块级子元素（如 <div class="code"><p>…</p></div>）时同理交给内层
+  var BLOCK_KIDS = 'p,div,ul,ol,h1,h2,h3,h4,h5,h6,table,pre';
+  var SCAN_SELECTOR = 'div,p,li,dd,td,blockquote,section,article';
+  var MAX_SCAN = 4000;          // 单次扫描元素上限，防止超长章节拖慢渲染
+  var PRE_TAGS = {PRE: 1, XMP: 1, PLAINTEXT: 1, LISTING: 1, PROGRAMLISTING: 1, LITERALLAYOUT: 1, SCREEN: 1, COMPUTEROUTPUT: 1};
+  var PRES_ATTRS = ['bgcolor', 'background', 'color', 'face', 'align', 'valign', 'width', 'height',
+    'border', 'cellpadding', 'cellspacing', 'nowrap', 'size', 'cols', 'rows'];
 
-  var LANGS = {
-    python: L(PY_KW, { lc: ['#'], bc: [], str: ['"', "'"], mstr: ['"""', "'''"], bi: 'print len range enumerate zip map filter open input int float str list dict set tuple sum min max abs sorted any all isinstance type super self'.split(' ') }),
-    javascript: L(JS_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"', "'"], mstr: ['`'], bi: 'console log error warn document window fetch Promise Array Object JSON Math Number String Map Set parseInt parseFloat setTimeout setInterval require module exports process alert' }),
-    go: L(GO_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"', "'"], mstr: ['`'], bi: 'make new len cap append delete copy panic recover print println fmt Printf Println Sprintf Errorf Error nil err string int int64 float64 bool byte rune error' }),
-    java: L(JAVA_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"', "'"], bi: 'System out println String Integer Long Double Boolean List Map ArrayList HashMap Optional Stream' }),
-    cpp: L(C_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"', "'"], preproc: true, bi: 'std cout cin endl vector string map set printf malloc free include define' }),
-    csharp: L(CS_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"', "'"], bi: 'Console WriteLine Console.WriteLine String Int32 List Dictionary Task' }),
-    sql: L(SQL_KW, { lc: ['--'], bc: [['/*', '*/']], str: ["'"], num: true }),
-    rust: L(RUST_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"'], mstr: ['r#"'], bi: 'println vec Some None Ok Err Option Result Box Rc Arc Vec String HashMap' }),
-    php: L(PHP_KW, { lc: ['//', '#'], bc: [['/*', '*/']], str: ['"', "'"], bi: 'echo var_dump print_r array count strlen preg_match' }),
-    kotlin: L(KT_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"'], mstr: ['"""'], bi: 'println print listOf mapOf setOf mutableListOf' }),
-    swift: L(SWIFT_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"'], mstr: ['"""'], bi: 'print String Int Double Array Dictionary Set' }),
-    dart: L(DART_KW, { lc: ['//'], bc: [['/*', '*/']], str: ['"', "'"], mstr: ["'''", '"""'], bi: 'print List Map Set String int double' }),
-    lua: L(LUA_KW, { lc: ['--'], bc: [['--[[', ']]']], str: ['"', "'"], bi: 'print pairs ipairs require table string math type tostring tonumber' }),
-    ruby: L(RUBY_KW, { lc: ['#'], bc: [], str: ['"', "'"], mstr: [], bi: 'puts print p require each map select reject times' }),
-    bash: L(BASH_KW, { lc: ['#'], bc: [], str: ['"', "'"], bi: 'ls cp mv rm mkdir grep sed awk cat sudo apt git npm node curl wget chmod chown tar zip find' }),
-    css: L('@media @import @keyframes @supports @font-face @charset @page important from to and not only'.split(' '), { lc: [], bc: [['/*', '*/']], str: ['"', "'"], num: true, css: true }),
-    json: L('true false null'.split(' '), { lc: [], bc: [], str: ['"'], num: true }),
-    yaml: L('true false null yes no on off'.split(' '), { lc: ['#'], bc: [], str: ['"', "'"], num: true })
-  };
+  /* ================= 运行时状态 ================= */
 
-  var ALIAS = {
-    py: 'python', python3: 'python',
-    js: 'javascript', node: 'javascript', jsx: 'javascript', ts: 'javascript', tsx: 'javascript', typescript: 'javascript', mjs: 'javascript', javascript: 'javascript',
-    go: 'go', golang: 'go',
-    java: 'java',
-    c: 'cpp', 'c++': 'cpp', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', h: 'cpp', cxx: 'cpp',
-    cs: 'csharp', csharp: 'csharp', 'c#': 'csharp',
-    sql: 'sql', mysql: 'sql', postgresql: 'sql', psql: 'sql', sqlite: 'sql', plsql: 'sql',
-    rs: 'rust', rust: 'rust',
-    php: 'php', php3: 'php', php5: 'php', php7: 'php',
-    kt: 'kotlin', kotlin: 'kotlin',
-    swift: 'swift',
-    dart: 'dart',
-    lua: 'lua',
-    rb: 'ruby', ruby: 'ruby',
-    sh: 'bash', bash: 'bash', shell: 'bash', zsh: 'bash', console: 'bash', terminal: 'bash',
-    css: 'css', scss: 'css', less: 'css',
-    json: 'json', json5: 'json',
-    yml: 'yaml', yaml: 'yaml',
-    html: 'html', xhtml: 'html', xml: 'html', svg: 'html', vue: 'html'
-  };
-
-  var HEUR_ORDER = ['python', 'javascript', 'go', 'java', 'cpp', 'csharp', 'sql', 'rust', 'php', 'kotlin', 'swift', 'dart', 'bash', 'ruby', 'lua'];
+  var blockSeq = 0;                 // 本章内代码块序号
+  var settings = null;              // 主窗口下发的设置
+  var langOverrides = {};           // blockKey(index) -> lang 值
+  var blockOverrides = {};          // elemKey(el)    -> 'force' | 'reject'
+  var theme = 'light';
+  var lastCtxEl = null;             // 最近一次右键命中的元素
+  var openPop = null;
+  var booted = false;
 
   /* ================= 基础工具 ================= */
 
   function esc(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
-  function escRe(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function post(msg) {
+    try {
+      window.parent.postMessage(msg, '*');
+    } catch (err) { /* 忽略 */ }
   }
-
-  /* ================= 高亮引擎 ================= */
-
-  var reCache = {};
-  // 返回 { re: RegExp, types: string[] }，types[i] 对应第 i+1 个捕获组
-  function buildRegex(name) {
-    if (reCache[name]) return reCache[name];
-    var lang = LANGS[name];
-    var types = [], src = [];
-    function push(type, s) { types.push(type); src.push(s); }
-
-    // 注意：JS 正则不支持 (?m) 内联标志，^ 的多行语义改用正则的 m 标志实现
-    if (lang.preproc) push('kw', '^[ \\t]*#[a-z_]+');
-    if (lang.bc) for (var b = 0; b < lang.bc.length; b++) {
-      var pair = lang.bc[b];
-      push('com', escRe(pair[0]) + '[\\s\\S]*?(?:' + escRe(pair[1]) + '|$)');
-    }
-    if (lang.lc) for (var l = 0; l < lang.lc.length; l++) push('com', escRe(lang.lc[l]) + '[^\\n]*');
-    if (lang.mstr) for (var m = 0; m < lang.mstr.length; m++) {
-      push('str', escRe(lang.mstr[m]) + '[\\s\\S]*?' + escRe(lang.mstr[m]));
-    }
-    if (lang.str) for (var s = 0; s < lang.str.length; s++) {
-      var q = escRe(lang.str[s]);
-      push('str', q + '(?:\\\\.|[^\\\\\\n' + q + '])*' + q + '?');
-    }
-    if (lang.css) push('num', '#[0-9a-fA-F]{3,8}\\b|\\b\\d[\\d.]*(?:px|em|rem|%|vh|vw|vmin|vmax|s|ms|deg|fr|ch|pt|dpi)?\\b');
-    else if (lang.num) push('num', '\\b0[xX][0-9a-fA-F_]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?[a-zA-Z]{0,3}\\b');
-    push('id', '[@$]?[A-Za-z_\\u00C0-\\uFFFF][\\w$\\u00C0-\\uFFFF-]*');
-
-    var re = new RegExp('(' + src.join(')|(') + ')', lang.preproc ? 'gm' : 'g');
-    reCache[name] = { re: re, types: types };
-    return reCache[name];
+  function blockKey(index) {
+    try { return location.pathname + '#' + index; } catch (err) { return '#' + index; }
+  }
+  function elemKey(el) {
+    try {
+      var all = document.body.getElementsByTagName('*');
+      for (var i = 0; i < all.length; i++) if (all[i] === el) return location.pathname + '@' + i;
+    } catch (err) { /* 忽略 */ }
+    return location.pathname + '@-1';
+  }
+  function clamp(v, lo, hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+  }
+  function closest(el, sel) {
+    return el && el.closest ? el.closest(sel) : null;
   }
 
-  function classifyIdent(word, lang, code, endPos) {
-    if (lang.kw.indexOf(word) >= 0) return 'kw';
-    if (lang.builtins && lang.builtins.indexOf(word) >= 0) return 'fn';
-    var nxt = code.slice(endPos).match(/^\s*([\s\S])/);
-    if (nxt && nxt[1] === '(') return 'fn';
-    if (lang.css) {
-      var after = code.slice(endPos).match(/^\s*:/);
-      if (after) return 'type';
-      return 'punc';
-    }
-    if (/^[A-Z]/.test(word)) return 'type';
-    return '';
+  /* ================= 原书样式剥离（可逆） ================= */
+
+  var backup = null;       // {links:[{el,disabled,media}], styles:[{el,media}], attrs:[{el,style,pres}]}
+  var stripReady = false;  // 采集（依赖原书 CSS 的 computed style）完成前不得剥离样式
+  var unifiedState = null; // 当前剥离状态：true=已剥离 / false=保留原书样式 / null=未处理
+  var interactive = false; // 初始化完成后才向主窗口回传块状态，避免开章时消息风暴
+
+  function isOurs(el) {
+    return !!(el.className && typeof el.className === 'string' && el.className.indexOf('mr-') === 0) ||
+      !!closest(el, '.mr-code');
   }
 
-  function highlight(code, langName) {
-    if (langName === 'html') return highlightHTML(code);
-    var lang = LANGS[langName];
-    if (!lang) return esc(code);
-    var built = buildRegex(langName);
-    var re = built.re, types = built.types;
-    re.lastIndex = 0;
-    var out = '', last = 0, m;
-    while ((m = re.exec(code))) {
-      if (m.index > last) out += esc(code.slice(last, m.index));
-      var txt = m[0], cls = '';
-      // 找到本次命中的捕获组：多分支交替下只有命中的那一个组有值
-      for (var g = 1; g < m.length; g++) {
-        if (m[g] !== undefined && m[g] !== '') {
-          var t = types[g - 1];
-          if (t === 'id') {
-            var word = txt.replace(/^[@$]/, '');
-            cls = classifyIdent(word, lang, code, re.lastIndex);
-          } else cls = t;
-          break;
+  function disableBookStyles() {
+    if (backup) return;
+    backup = {links: [], styles: [], attrs: []};
+    var i, j, el;
+
+    var links = document.getElementsByTagName('link');
+    for (i = 0; i < links.length; i++) {
+      el = links[i];
+      if (!/(^|\s)stylesheet(\s|$)/i.test(el.getAttribute('rel') || '')) continue;
+      backup.links.push({el: el, disabled: el.disabled, media: el.media});
+      try { el.disabled = true; } catch (err) { /* 忽略 */ }
+      el.setAttribute('media', 'not all');
+    }
+
+    var styles = document.getElementsByTagName('style');
+    for (i = 0; i < styles.length; i++) {
+      el = styles[i];
+      if (el.id === 'mr-reader-css') continue;
+      backup.styles.push({el: el, media: el.getAttribute('media')});
+      el.setAttribute('media', 'not all');
+    }
+
+    var all = document.body ? document.body.getElementsByTagName('*') : [];
+    for (i = 0; i < all.length; i++) {
+      el = all[i];
+      if (isOurs(el)) continue;
+      var st = el.getAttribute('style');
+      var pres = null;
+      for (j = 0; j < PRES_ATTRS.length; j++) {
+        if (el.hasAttribute(PRES_ATTRS[j])) {
+          pres = pres || {};
+          pres[PRES_ATTRS[j]] = el.getAttribute(PRES_ATTRS[j]);
         }
       }
-      out += cls ? '<span class="tok-' + cls + '">' + esc(txt) + '</span>' : esc(txt);
-      last = re.lastIndex;
-      if (m[0].length === 0) re.lastIndex++;
+      if (!st && !pres) continue;
+      backup.attrs.push({el: el, style: st, pres: pres});
+      if (st) el.removeAttribute('style');
+      if (pres) for (j = 0; j < PRES_ATTRS.length; j++) el.removeAttribute(PRES_ATTRS[j]);
     }
-    out += esc(code.slice(last));
-    return out;
   }
 
-  // HTML/XML 特化：注释 / 标签内部（标签名、属性名、属性值）
-  function highlightHTML(code) {
-    var out = '', i = 0, n = code.length;
-    while (i < n) {
-      if (code.startsWith('<!--', i)) {
-        var end = code.indexOf('-->', i);
-        var seg = end < 0 ? code.slice(i) : code.slice(i, end + 3);
-        out += '<span class="tok-com">' + esc(seg) + '</span>';
-        i += seg.length;
-      } else if (code[i] === '<') {
-        var gt = code.indexOf('>', i);
-        var tag = gt < 0 ? code.slice(i) : code.slice(i, gt + 1);
-        out += tagInner(tag);
-        i += tag.length;
-      } else {
-        var lt = code.indexOf('<', i);
-        var dm = lt < 0 ? code.slice(i) : code.slice(i, lt);
-        out += esc(dm).replace(/&[a-zA-Z#\d]+;/g, '<span class="tok-num">$&</span>');
-        i += dm.length;
+  function restoreBookStyles() {
+    if (!backup) return;
+    var i, j, k, item;
+    for (i = 0; i < backup.links.length; i++) {
+      item = backup.links[i];
+      try { item.el.disabled = item.disabled; } catch (err) { /* 忽略 */ }
+      if (item.media) item.el.setAttribute('media', item.media); else item.el.removeAttribute('media');
+    }
+    for (i = 0; i < backup.styles.length; i++) {
+      item = backup.styles[i];
+      if (item.media) item.el.setAttribute('media', item.media); else item.el.removeAttribute('media');
+    }
+    for (i = 0; i < backup.attrs.length; i++) {
+      item = backup.attrs[i];
+      if (item.style) item.el.setAttribute('style', item.style);
+      if (item.pres) {
+        var keys = [];
+        for (k in item.pres) if (Object.prototype.hasOwnProperty.call(item.pres, k)) keys.push(k);
+        for (j = 0; j < keys.length; j++) item.el.setAttribute(keys[j], item.pres[keys[j]]);
       }
     }
-    return out;
-  }
-  function tagInner(tag) {
-    return tag.replace(/([\w:-]+)=(("[^"]*")|('[^']*'))/g,
-      '<span class="tok-type">$1</span>=<span class="tok-str">$2</span>')
-      .replace(/^(&lt;\/?)([\w:-]+)/, function (_, a, name) {
-        return a + '<span class="tok-fn">' + name + '</span>';
-      })
-      .replace(/^</, '&lt;').replace(/^&lt;/, '&lt;')
-      .replace(/>$/, '&gt;');
+    backup = null;
   }
 
-  /* ================= 语言检测 ================= */
-
-  function detectLang(code, el) {
-    var scope = el, depth = 0;
-    while (scope && depth < 4) {
-      var cn = (scope.getAttribute && scope.getAttribute('class')) || '';
-      var mm = cn.match(/(?:language|lang|highlight|syntax|brush)[\s:-]*([\w+#]+)/i);
-      if (mm) {
-        var key = mm[1].toLowerCase();
-        if (ALIAS[key]) return ALIAS[key];
-        if (LANGS[key]) return key;
-      }
-      scope = scope.parentElement; depth++;
-    }
-    // XML/HTML 启发式：<?xml 声明或成对标签 → 复用 html 高亮器（Maven/ant/布局 XML 等）
-    if (/^\s*<\?xml/i.test(code) ||
-        (/<[a-zA-Z][\w:.-]*(\s[^<>]*)?>/.test(code) && /<\/[a-zA-Z][\w:.-]*\s*>/.test(code))) {
-      return 'html';
-    }
-
-    // 启发式：关键字计数
-    var best = null, bestScore = 0;
-    for (var i = 0; i < HEUR_ORDER.length; i++) {
-      var name = HEUR_ORDER[i];
-      var list = LANGS[name].kw;
-      var score = 0;
-      for (var k = 0; k < list.length; k++) {
-        var w = list[k];
-        if (w.indexOf(' ') >= 0) continue;
-        var hits = code.match(new RegExp('\\b' + w + '\\b', 'g'));
-        if (hits) score += Math.min(hits.length, 3);
-      }
-      if (score > bestScore) { bestScore = score; best = name; }
-    }
-    return bestScore >= 3 ? best : null;
+  function applyUnify(on) {
+    document.documentElement.setAttribute('data-mr-unify', on ? '1' : '0');
+    // 采集阶段必须保留原书 CSS：等宽字体 / white-space 等信号来自 computed style
+    if (!stripReady) return;
+    if (on === unifiedState) return;
+    unifiedState = on;
+    if (on) disableBookStyles(); else restoreBookStyles();
   }
 
-  /* ================= 代码块候选识别 ================= */
-
-  // 等宽字体（各 EPUB 使用的字体名并不统一）
-  var MONO_RE = /(mono|consolas|courier|menlo|monaco|andale|source\s?code\s?pro|jetbrains|dejavu sans mono)/i;
-  // 语义类名：code / code-block / programlisting / literallayout / screen / snippet ...
-  var CLASS_RE = /(^|[\s_-])(code|codeblock|codeline|programlisting|literallayout|screen|listing|snippet|sourcecode|highlight|monospace|computeroutput|literal|pre)([\s_-]|$)/i;
-  // 语义标签：HTML 原生 + DocBook 常用容器
-  var TAG_SELECTOR = 'pre,code,xmp,plaintext,programlisting,literallayout,screen,listing,computeroutput';
-  // 容器内已有更具体的代码块时，交给内层处理
-  var INNER_SELECTOR = 'pre,code,xmp,img,table,video,canvas,.mr-code';
-  // 容器内还有块级子元素（如 <div class="code"><p>…</p></div>）时同理交给内层
-  var BLOCK_KIDS = 'p,div,ul,ol,h1,h2,h3,h4,h5,h6,table';
-  var MAX_SCAN = 4000; // 单次扫描元素上限，防止超长章节拖慢渲染
+  /* ================= 候选识别 ================= */
 
   function markDone(el) {
     el.__mrdone = true;
     var kids = el.querySelectorAll ? el.querySelectorAll('*') : [];
     for (var i = 0; i < kids.length; i++) kids[i].__mrdone = true;
   }
-
-  function markAllDone(run) {
-    for (var i = 0; i < run.length; i++) markDone(run[i]);
-  }
-
   function isMonoBlock(el) {
     var st = window.getComputedStyle(el);
     if (!st) return false;
@@ -275,33 +174,86 @@
     if (/^pre/.test(st.whiteSpace || '')) return true; // white-space:pre / pre-wrap
     return MONO_RE.test(st.fontFamily || '');
   }
-
   function hasClassHint(el) {
     var cn = (el.getAttribute && el.getAttribute('class')) || '';
     return cn ? CLASS_RE.test(cn) : false;
   }
+  function hasLangClass(el) {
+    var cn = (el.getAttribute && el.getAttribute('class')) || '';
+    return cn ? LANG_CLASS_RE.test(cn) : false;
+  }
 
-  // 收集候选并按"相邻兄弟"分组：逐行 <p class="code"> 会被合并成一个代码块
+  // 多维置信度打分：返回一个 0–100 的分数。
+  // 正信号来自容器语义与代码结构，负信号来自自然语言与版面噪声特征。
+  function scoreCode(el, code) {
+    var s = HL.stats ? HL.stats(code) : {lines: 1, nonEmpty: 1, avgLen: 0, cjk: 0, indent: 0, codePunct: 0, sentence: 0, art: 0};
+    var tag = el.tagName.toUpperCase();
+    var score = 0;
+
+    if (tag === 'PRE' || tag === 'XMP' || tag === 'PLAINTEXT') score += 45;
+    else if (tag === 'CODE') score += 35;
+    else if (PRE_TAGS[tag]) score += 35;
+
+    if (hasLangClass(el)) score += 32;
+    else if (hasClassHint(el)) score += 14;
+
+    if (isMonoBlock(el)) score += 18;
+
+    if (s.lines >= 2) score += 4;
+    if (s.lines >= 5) score += 4;
+    if (s.indent >= 0.3) score += 10;
+    else if (s.indent >= 0.15) score += 5;
+    if (s.codePunct >= 1.5) score += 14;
+    else if (s.codePunct >= 0.7) score += 8;
+    else if (s.codePunct >= 0.3) score += 3;
+
+    // 负信号
+    if (s.cjk > 0.28) score -= 32;
+    else if (s.cjk > 0.12) score -= 12;
+    if (s.sentence > 1.2 && s.avgLen > 45) score -= 20;
+    if (s.avgLen > 130) score -= 18;
+    if (s.art > 0.4) score -= 28;
+    if (s.lines <= 1 && code.length < 40) score -= 25;
+    if (/ISBN|版权所有|All rights reserved|^\s*(序|前言|目录)\s*$/i.test(code)) score -= 20;
+
+    return clamp(Math.round(score), 0, 100);
+  }
+
+  function thresholdFor(run) {
+    var tag = run[0].tagName.toUpperCase();
+    return (tag === 'PRE' || tag === 'XMP' || tag === 'PLAINTEXT' || PRE_TAGS[tag]) ? 40 : 62;
+  }
+
+  function groupText(run) {
+    var parts = [];
+    for (var i = 0; i < run.length; i++) parts.push(run[i].textContent.replace(/\r\n?/g, '\n'));
+    return parts.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
+  }
+
   function collect() {
-    var groups = [], hits = [], used = [], i, el;
+    var groups = [], hits = [], used = [], i, el, j;
 
+    // ① 语义标签：整段 <pre> 之类，逐个独立成组
     var byTag = document.querySelectorAll(TAG_SELECTOR);
     for (i = 0; i < byTag.length; i++) {
       el = byTag[i];
+      if (el.__mrdone) continue;
       // 行内 <code>foo</code> 属于正文的一部分，只有块级或多行时才装饰
       if (el.tagName === 'CODE') {
         var cs = window.getComputedStyle(el);
-        if ((!cs || cs.display === 'inline') && el.textContent.indexOf('\n') < 0) continue;
+        if ((!cs || cs.display === 'inline') && el.textContent.indexOf('\n') < 0) { markDone(el); continue; }
       }
       groups.push([el]);
+      markDone(el); // 先占位，后续按分数决定要不要装饰
     }
 
-    var all = document.body ? document.body.querySelectorAll('div,p,li,dd,td,blockquote,section,article') : [];
+    // ② 通用容器：靠类名 / 等宽字体识别，需过更高阈值
+    var all = document.body ? document.body.querySelectorAll(SCAN_SELECTOR) : [];
     var limit = Math.min(all.length, MAX_SCAN);
     for (i = 0; i < limit; i++) {
       el = all[i];
       if (el.__mrdone) continue;
-      if (!hasClassHint(el) && !isMonoBlock(el)) continue;
+      if (!hasClassHint(el) && !isMonoBlock(el) && !hasLangClass(el)) continue;
       if (el.querySelector(INNER_SELECTOR)) continue;
       if (el.querySelector(BLOCK_KIDS)) continue;
       hits.push(el);
@@ -321,39 +273,85 @@
       }
       groups.push(run);
     }
+
+    // ③ 用户手动标记为代码块的元素（主窗口下发 blockOverrides）
+    var hasForce = false;
+    for (j in blockOverrides) {
+      if (Object.prototype.hasOwnProperty.call(blockOverrides, j) && blockOverrides[j] === 'force') hasForce = true;
+    }
+    if (hasForce && document.body) {
+      var nodes = document.body.getElementsByTagName('*');
+      for (i = 0; i < nodes.length; i++) {
+        el = nodes[i];
+        if (el.__mrdone || blockOverrides[location.pathname + '@' + i] !== 'force') continue;
+        groups.push([el]);
+        markDone(el);
+      }
+    }
+
     return groups;
   }
 
-  /* ================= 语言工具条（逐块独立） ================= */
+  /* ================= 代码块装饰 ================= */
 
-  // 候选语言沿用 LANGS 的键 + html（走 highlightHTML），避免维护两份清单
-  var LANG_ORDER = ['python', 'javascript', 'go', 'java', 'cpp', 'csharp', 'sql', 'rust', 'php',
-    'kotlin', 'swift', 'dart', 'lua', 'ruby', 'bash', 'css', 'json', 'yaml', 'html'];
-  var LANG_LABEL = {
-    python: 'Python', javascript: 'JavaScript', go: 'Go', java: 'Java', cpp: 'C/C++', csharp: 'C#',
-    sql: 'SQL', rust: 'Rust', php: 'PHP', kotlin: 'Kotlin', swift: 'Swift', dart: 'Dart', lua: 'Lua',
-    ruby: 'Ruby', bash: 'Shell', css: 'CSS', json: 'JSON', yaml: 'YAML', html: 'HTML/XML'
-  };
-  var blockSeq = 0;            // 本章内代码块序号，用于逐块记忆的 key
-  var pendingOverrides = null; // 父窗口下发的逐块语言选择
-  var openPop = null;
+  var LANG_EXTRA = ['ini', 'markdown', 'diff', 'makefile', 'dockerfile', 'nginx', 'perl', 'scala', 'objectivec'];
+
+  function langList() {
+    var base = (HL.LANG_ORDER || []).slice();
+    for (var i = 0; i < LANG_EXTRA.length; i++) {
+      if (HL.hasLang && HL.hasLang(LANG_EXTRA[i])) base.push(LANG_EXTRA[i]);
+    }
+    return base;
+  }
 
   function langLabel(lang) {
-    return lang ? (LANG_LABEL[lang] || lang) : '纯文本';
+    return HL.langLabel ? HL.langLabel(lang) : (lang || '纯文本');
   }
 
-  function blockKey(index) {
-    try { return location.pathname + '#' + index; } catch (err) { return '#' + index; }
+  function setNums(wrap, on) {
+    wrap.__mrNums = !!on;
+    wrap.setAttribute('data-nums', on ? '1' : '0');
   }
 
-  function applyTheme(theme) {
-    var de = document.documentElement;
-    if (theme === 'dark') de.setAttribute('data-mr-code-theme', 'dark');
-    else de.removeAttribute('data-mr-code-theme');
+  function setCollapsed(wrap, on) {
+    wrap.setAttribute('data-collapsed', on ? '1' : '0');
+    if (wrap.__mrFold) wrap.__mrFold.textContent = on ? '展开全部（' + wrap.__mrLines + ' 行）' : '折叠';
   }
 
-  function closeAnyPop() {
-    if (openPop) { openPop.className = 'mr-lang-pop'; openPop = null; }
+  function refreshFoldable(wrap) {
+    var th = settings && typeof settings.foldThreshold === 'number' ? settings.foldThreshold : 30;
+    var foldable = th > 0 && wrap.__mrLines > th;
+    wrap.setAttribute('data-foldable', foldable ? '1' : '0');
+    if (!foldable) setCollapsed(wrap, false);
+  }
+
+  function highlight(code, lang) {
+    if (HL.highlight) return HL.highlight(code, lang);
+    return esc(code);
+  }
+
+  function applyLang(wrap, lang, manual) {
+    if (lang && HL.hasLang && !HL.hasLang(lang)) lang = '';
+    wrap.__mrLang = lang || '';
+    wrap.__mrManual = !!manual;
+    var codeEl = wrap.querySelector('code');
+    if (codeEl) codeEl.innerHTML = highlight(wrap.__mrSrc, wrap.__mrLang);
+    wrap.className = 'mr-code' + (wrap.__mrLang ? ' mr-lang-' + wrap.__mrLang : '');
+    if (wrap.__mrLabel) wrap.__mrLabel.textContent = (manual ? '' : '自动 · ') + langLabel(wrap.__mrLang);
+    markLangItems(wrap, manual ? (wrap.__mrLang || 'plain') : 'auto');
+    reportState(wrap);
+  }
+
+  function reportState(wrap) {
+    if (!interactive) return; // 开章初始化阶段不回传，避免逐块消息风暴
+    post({
+      type: 'mr-code-changed',
+      index: wrap.__mrIndex,
+      lang: wrap.__mrLang || null,
+      lines: wrap.__mrLines,
+      collapsed: wrap.getAttribute('data-collapsed') === '1',
+      showNums: wrap.__mrNums !== false
+    });
   }
 
   function markLangItems(wrap, value) {
@@ -363,18 +361,38 @@
     }
   }
 
-  // 重新高亮：只替换 code 内容，行号列不变（行数相同）
-  function applyLang(wrap, lang, manual) {
-    var codeEl = wrap.querySelector('code');
-    if (codeEl) codeEl.innerHTML = lang ? highlight(wrap.__mrSrc, lang) : esc(wrap.__mrSrc);
-    wrap.className = 'mr-code' + (lang ? ' mr-lang-' + lang : '');
-    if (wrap.__mrLabel) wrap.__mrLabel.textContent = (manual ? '' : '自动 · ') + langLabel(lang);
-    markLangItems(wrap, manual ? (lang || 'plain') : 'auto');
+  function closeAnyPop() {
+    if (openPop) { openPop.className = 'mr-lang-pop'; openPop = null; }
+  }
+
+  function addLangItem(pop, wrap, index, label, value) {
+    var it = document.createElement('button');
+    it.type = 'button';
+    it.className = 'mr-lang-item';
+    it.textContent = label;
+    it.setAttribute('data-v', value);
+    it.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      closeAnyPop();
+      var lang = value === 'auto' ? wrap.__mrAuto : (value === 'plain' ? '' : value);
+      applyLang(wrap, lang, value !== 'auto');
+      post({type: 'mr-lang-set', key: blockKey(index), lang: value});
+    });
+    pop.appendChild(it);
   }
 
   function buildBar(wrap, index, auto) {
     var bar = document.createElement('div');
     bar.className = 'mr-bar';
+
+    var copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'mr-bar-btn';
+    copy.textContent = '复制';
+    copy.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      copyCode(wrap);
+    });
 
     var btn = document.createElement('button');
     btn.type = 'button';
@@ -390,32 +408,12 @@
 
     var pop = document.createElement('div');
     pop.className = 'mr-lang-pop';
-
-    function addItem(label, value) {
-      var it = document.createElement('button');
-      it.type = 'button';
-      it.className = 'mr-lang-item';
-      it.textContent = label;
-      it.setAttribute('data-v', value);
-      it.addEventListener('click', function (ev) {
-        ev.stopPropagation();
-        closeAnyPop();
-        var lang = value === 'auto' ? wrap.__mrAuto : (value === 'plain' ? '' : value);
-        applyLang(wrap, lang, value !== 'auto');
-        try {
-          // 逐块选择回传主窗口持久化（key = 章节路径#块序号）
-          window.parent.postMessage({type: 'mr-lang-set', key: blockKey(index), lang: value}, '*');
-        } catch (err) { /* 忽略 */ }
-      });
-      pop.appendChild(it);
-    }
-
-    addItem('自动 · ' + langLabel(auto), 'auto');
-    addItem('纯文本', 'plain');
-    for (var i = 0; i < LANG_ORDER.length; i++) {
-      var n = LANG_ORDER[i];
-      if (n !== 'html' && !LANGS[n]) continue;
-      addItem(LANG_LABEL[n] || n, n);
+    addLangItem(pop, wrap, index, '自动 · ' + langLabel(auto), 'auto');
+    addLangItem(pop, wrap, index, '纯文本', 'plain');
+    var list = langList();
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i];
+      addLangItem(pop, wrap, index, langLabel(n), n);
     }
 
     btn.addEventListener('click', function (ev) {
@@ -424,54 +422,49 @@
       closeAnyPop();
       pop.className = 'mr-lang-pop open';
       openPop = pop;
+      // 贴近视口底部时向上翻转，避免弹层被截断
+      try {
+        var r = pop.getBoundingClientRect();
+        if (r.bottom > window.innerHeight - 8 && r.top > 120) pop.className = 'mr-lang-pop open up';
+      } catch (err) { /* 忽略 */ }
     });
 
+    bar.appendChild(copy);
     bar.appendChild(btn);
     bar.appendChild(pop);
     wrap.appendChild(bar);
-    name.textContent = '自动 · ' + langLabel(auto);
     markLangItems(wrap, 'auto');
   }
 
-  function applyOverrides(map) {
-    var wraps = document.querySelectorAll('.mr-code');
-    for (var i = 0; i < wraps.length; i++) {
-      var w = wraps[i];
-      var v = map[blockKey(w.__mrIndex)];
-      if (v === undefined || v === null || v === 'auto') { applyLang(w, w.__mrAuto, false); continue; }
-      var lang = v === 'plain' ? '' : v;
-      if (lang && !LANGS[lang] && lang !== 'html') continue;
-      applyLang(w, lang, true);
-    }
-  }
-
-  document.addEventListener('click', closeAnyPop);
-
-  /* ================= 行号装饰 ================= */
-
-  // run 为待装饰的元素数组：单个 <pre>，或合并后的连续代码段落
-  function decorate(run) {
+  function decorate(run, forced) {
     var first = run[0];
-    if (!first || first.__mrdone) return false;
+    if (!first) return false;
 
     for (var i = 0; i < run.length; i++) {
       // ASCII 图 / 复杂内容跳过
-      if (run[i].querySelector && run[i].querySelector('img,video,canvas,table')) { markAllDone(run); return false; }
+      if (run[i].querySelector && run[i].querySelector('img,video,canvas,table,svg')) return false;
     }
 
-    var parts = [];
-    for (i = 0; i < run.length; i++) parts.push(run[i].textContent.replace(/\r\n?/g, '\n'));
-    var code = parts.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
-    if (!code.trim()) { markAllDone(run); return false; }
-    if (code.indexOf('\n') < 0 && code.length < 24) { markAllDone(run); return false; } // 极短行内代码不包装
-    var lang = detectLang(code, first);
-    var html = highlight(code, lang || '');
+    // 元素索引必须在替换前算好（替换后就脱离文档，elemKey 会退化成 @-1）
+    var key = elemKey(first);
+    var code = groupText(run);
+    if (!code.trim()) return false;
+    if (code.indexOf('\n') < 0 && code.length < 24) return false; // 极短行内代码不包装
+
+    if (!forced) {
+      // 用户之前手动取消过这一块，本次渲染直接跳过
+      if (blockOverrides[key] === 'reject') return false;
+      if (scoreCode(first, code) < thresholdFor(run)) return false;
+    }
+
+    var auto = (settings && settings.autoDetectLang === false) ? null : (HL.detectLang ? HL.detectLang(code, first) : null);
+    var html = highlight(code, auto || '');
     var lines = html.split('\n');
     var nums = [];
     for (i = 1; i <= lines.length; i++) nums.push(i);
 
     var wrap = document.createElement('div');
-    wrap.className = 'mr-code' + (lang ? ' mr-lang-' + lang : '');
+    wrap.className = 'mr-code' + (auto ? ' mr-lang-' + auto : '');
     var ncol = document.createElement('div');
     ncol.className = 'mr-nums';
     ncol.textContent = nums.join('\n');
@@ -485,11 +478,31 @@
     wrap.appendChild(ncol);
     wrap.appendChild(body);
 
-    // 保存源码、自动检测结果与块序号，供逐块切换语言时重算
+    var fold = document.createElement('div');
+    fold.className = 'mr-fold';
+    fold.setAttribute('role', 'button');
+    wrap.appendChild(fold);
+    wrap.__mrFold = fold;
+
     wrap.__mrSrc = code;
-    wrap.__mrAuto = lang;
+    wrap.__mrAuto = auto;
+    wrap.__mrLang = auto || '';
+    wrap.__mrManual = false;
+    wrap.__mrLines = lines.length;
+    wrap.__mrOrig = run;
     wrap.__mrIndex = blockSeq++;
-    buildBar(wrap, wrap.__mrIndex, lang);
+    wrap.__mrKey = key;
+
+    fold.addEventListener('click', function () {
+      setCollapsed(wrap, wrap.getAttribute('data-collapsed') !== '1');
+      reportState(wrap);
+    });
+
+    buildBar(wrap, wrap.__mrIndex, auto);
+    setNums(wrap, !settings || settings.codeLineNumbers !== false);
+    refreshFoldable(wrap);
+
+    wrap.__mrLabel.textContent = '自动 · ' + langLabel(auto);
 
     // 用代码块整体替换原元素（可能是连续的多段）
     first.parentNode.insertBefore(wrap, first);
@@ -500,58 +513,326 @@
     return true;
   }
 
-  /* ================= 字号控制 ================= */
+  function revertBlock(wrap) {
+    var orig = wrap.__mrOrig || [];
+    var parent = wrap.parentNode;
+    if (!parent) return false;
+    for (var i = 0; i < orig.length; i++) parent.insertBefore(orig[i], wrap);
+    parent.removeChild(wrap);
+    post({type: 'mr-block-set', key: wrap.__mrKey || elemKey(orig[0]), value: 'reject'});
+    return true;
+  }
 
-  var zoom = 1;
+  function findBlock(index) {
+    var wraps = document.querySelectorAll('.mr-code');
+    for (var i = 0; i < wraps.length; i++) if (wraps[i].__mrIndex === index) return wraps[i];
+    return null;
+  }
+
+  /* ================= 复制 ================= */
+
+  function copyText(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', 'readonly');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    document.body.removeChild(ta);
+    post({type: 'mr-clipboard', text: text, ok: ok});
+    return ok;
+  }
+
+  function copyCode(wrap) {
+    return copyText(wrap.__mrSrc || '');
+  }
+
+  function copySelection() {
+    var sel = window.getSelection();
+    var text = sel ? String(sel.toString()) : '';
+    if (!text) { post({type: 'mr-clipboard', text: '', ok: false}); return false; }
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    post({type: 'mr-clipboard', text: text, ok: ok});
+    return ok;
+  }
+
+  /* ================= 右键上下文 ================= */
+
+  function onContextMenu(e) {
+    var t = e.target;
+    var el = (t && t.nodeType === 1) ? t : (t && t.parentElement) || null;
+    lastCtxEl = el;
+
+    var wrap = closest(el, '.mr-code');
+    var img = null;
+    if (el && el.tagName === 'IMG') {
+      try {
+        img = {src: new URL(el.getAttribute('src') || '', location.href).href, alt: el.getAttribute('alt') || ''};
+      } catch (err) { img = null; }
+    }
+    var code = null;
+    if (wrap) {
+      code = {
+        index: wrap.__mrIndex,
+        lang: wrap.__mrLang || null,
+        lines: wrap.__mrLines,
+        collapsed: wrap.getAttribute('data-collapsed') === '1',
+        showNums: wrap.__mrNums !== false
+      };
+    }
+    var sel = window.getSelection();
+    e.preventDefault();
+    post({
+      type: 'mr-context',
+      x: e.clientX,
+      y: e.clientY,
+      selection: sel ? String(sel.toString()) : '',
+      code: code,
+      image: img,
+      inCode: !!wrap
+    });
+  }
+
+  /* ================= 指令执行 ================= */
+
+  function scrollTop() {
+    var de = document.documentElement;
+    var old = de.style.scrollBehavior;
+    de.style.scrollBehavior = 'auto'; // 切章时不要平滑滚动动画
+    window.scrollTo(0, 0);
+    de.style.scrollBehavior = old;
+  }
+
+  function runCodeAction(msg) {
+    var wrap = findBlock(msg.index);
+    if (!wrap) return;
+    switch (msg.action) {
+      case 'lang':
+        applyLang(wrap, msg.value === 'plain' ? '' : msg.value, true);
+        post({type: 'mr-lang-set', key: blockKey(wrap.__mrIndex), lang: msg.value || 'auto'});
+        break;
+      case 'numbers':
+        setNums(wrap, wrap.__mrNums === false);
+        reportState(wrap);
+        break;
+      case 'collapse':
+        setCollapsed(wrap, true);
+        reportState(wrap);
+        break;
+      case 'expand':
+        setCollapsed(wrap, false);
+        reportState(wrap);
+        break;
+      case 'reject':
+        revertBlock(wrap);
+        break;
+      default:
+        break;
+    }
+  }
+
+  function markCode() {
+    var el = lastCtxEl;
+    if (!el || !el.parentNode) return;
+    if (closest(el, '.mr-code')) return;      // 已经是代码块
+    if (el === document.body || el === document.documentElement) return;
+    var key = elemKey(el);                    // 同样要在替换前取索引
+    if (decorate([el], true)) {
+      post({type: 'mr-block-set', key: key, value: 'force'});
+    }
+  }
+
+  /* ================= 主题与设置 ================= */
+
+  function applyTheme(t) {
+    theme = t === 'dark' ? 'dark' : 'light';
+    if (theme === 'dark') document.documentElement.setAttribute('data-mr-theme', 'dark');
+    else document.documentElement.removeAttribute('data-mr-theme');
+  }
+
+  function applySettings(s) {
+    if (!s) return;
+    settings = s;
+    var de = document.documentElement;
+    de.setAttribute('data-mr-font', s.fontFamily === 'sans' ? 'sans' : 'serif');
+    de.setAttribute('data-mr-indent', s.indent ? '1' : '0');
+    de.setAttribute('data-mr-justify', s.justify ? '1' : '0');
+    de.setAttribute('data-mr-dimimg', s.dimImagesInDark ? '1' : '0');
+    if (typeof s.fontSize === 'number') de.style.setProperty('--mr-body-fs', s.fontSize + 'px');
+    if (typeof s.codeFontSize === 'number') de.style.setProperty('--mr-code-fs', s.codeFontSize + 'px');
+    if (typeof s.lineHeight === 'number') de.style.setProperty('--mr-lh', String(s.lineHeight));
+    if (typeof s.pageWidth === 'number') de.style.setProperty('--mr-width', s.pageWidth + 'px');
+
+    var wraps = document.querySelectorAll('.mr-code');
+    for (var i = 0; i < wraps.length; i++) {
+      if (!wraps[i].__mrManual) {
+        var auto = settings.autoDetectLang === false ? null : wraps[i].__mrAuto;
+        applyLang(wraps[i], auto, false);
+      }
+      setNums(wraps[i], s.codeLineNumbers !== false);
+      refreshFoldable(wraps[i]);
+    }
+    applyUnify(s.unifyStyle !== false);
+  }
+
+  function applyLangOverrides(map) {
+    langOverrides = map || {};
+    var wraps = document.querySelectorAll('.mr-code');
+    for (var i = 0; i < wraps.length; i++) {
+      var w = wraps[i];
+      var v = langOverrides[blockKey(w.__mrIndex)];
+      if (v === undefined || v === null || v === 'auto') {
+        applyLang(w, settings && settings.autoDetectLang === false ? null : w.__mrAuto, false);
+        continue;
+      }
+      applyLang(w, v === 'plain' ? '' : v, true);
+    }
+  }
+
+  function applyBlockOverrides(map) {
+    blockOverrides = map || {};
+    var wraps = document.querySelectorAll('.mr-code');
+    for (var i = 0; i < wraps.length; i++) {
+      if (blockOverrides[wraps[i].__mrKey] === 'reject') revertBlock(wraps[i]);
+    }
+  }
+
   window.addEventListener('message', function (e) {
     var d = e.data || {};
-    if (d.type === 'mr-font') {
-      if (typeof d.set === 'number') {
-        zoom = Math.min(2, Math.max(0.6, d.set));
-      } else {
-        zoom = Math.min(2, Math.max(0.6, zoom + (d.delta || 0)));
-      }
-      document.documentElement.style.setProperty('zoom', String(zoom));
-    } else if (d.type === 'mr-scroll-top') {
-      window.scrollTo({ top: 0 });
-    } else if (d.type === 'mr-code-theme') {
-      applyTheme(d.theme); // 'dark' 或 'light'
-    } else if (d.type === 'mr-lang-overrides') {
-      pendingOverrides = d.map || {};
-      applyOverrides(pendingOverrides);
+    switch (d.type) {
+      case 'mr-theme':
+        applyTheme(d.theme);
+        break;
+      case 'mr-settings':
+        applySettings(d.settings);
+        break;
+      case 'mr-lang-overrides':
+        applyLangOverrides(d.map);
+        break;
+      case 'mr-block-overrides':
+        applyBlockOverrides(d.map);
+        break;
+      case 'mr-scroll-top':
+        scrollTop();
+        break;
+      case 'mr-copy':
+        copySelection();
+        break;
+      case 'mr-select-all':
+        try {
+          var r = document.createRange();
+          r.selectNodeContents(document.body);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(r);
+        } catch (err) { /* 忽略 */ }
+        break;
+      case 'mr-copy-code':
+        var w = findBlock(d.index);
+        if (w) copyCode(w);
+        break;
+      case 'mr-code-action':
+        runCodeAction(d);
+        break;
+      case 'mr-mark-code':
+        markCode();
+        break;
+      default:
+        break;
     }
   });
+
+  document.addEventListener('click', closeAnyPop);
+  document.addEventListener('contextmenu', onContextMenu);
+
+  /* ================= 表格横向滚动容器 ================= */
+
+  // 给顶层表格套一层 .mr-table-wrap，超宽时可横向滚动而不被 max-width 截断；
+  // 单元格内嵌套的内层表格交给外层容器负责，避免重复包裹。
+  function wrapTables() {
+    var tables = document.querySelectorAll('table');
+    for (var i = 0; i < tables.length; i++) {
+      var t = tables[i];
+      if (closest(t, '.mr-table-wrap')) continue;
+      if (closest(t, 'td,th')) continue;
+      var wrap = document.createElement('div');
+      wrap.className = 'mr-table-wrap';
+      t.parentNode.insertBefore(wrap, t);
+      wrap.appendChild(t);
+    }
+  }
 
   /* ================= 启动 ================= */
 
   function run() {
-    var info = {groups: 0, blocks: 0};
+    var info = {groups: 0, blocks: 0, rejected: 0};
     try {
+      // 顺序不可颠倒：候选识别依赖原书 CSS 生效后的 computed style，
+      // 因此必须先采集，再剥离原书样式。
       var groups = collect();
       info.groups = groups.length;
+      stripReady = true;
+      applyUnify(!settings || settings.unifyStyle !== false);
       for (var i = 0; i < groups.length; i++) {
         try {
-          if (decorate(groups[i])) info.blocks++;
+          if (decorate(groups[i], false)) info.blocks++;
+          else info.rejected++;
         } catch (err) { /* 单个块失败不影响其余 */ }
       }
-      // 主题/语言覆盖可能早于装饰完成到达，这里补应用一次
-      if (pendingOverrides) applyOverrides(pendingOverrides);
+      wrapTables();
+      // 主题/语言/纠正可能早于装饰完成到达，这里补应用一次
+      applyBlockOverrides(blockOverrides);
+      applyLangOverrides(langOverrides);
+      if (settings) applySettings(settings);
     } catch (err) { /* 保证不破坏章节渲染 */ }
+    interactive = true;
     try {
       window.__mrInfo = info; // 便于在 devtools 里排查：iframe.contentWindow.__mrInfo
       if (window.parent && window.parent.__MR_DEBUG) console.log('[mr-inject]', info);
     } catch (err) { /* 忽略 */ }
   }
-  // 调试钩子：可在 devtools 控制台直接验证着色输出，例如
+
+  function boot() {
+    if (booted) return;
+    booted = true;
+    run();
+  }
+
+  // 是否存在外链样式表：内联 <style> 在 DOMContentLoaded 时已生效，不必再等
+  function hasExternalCSS() {
+    try {
+      var links = document.getElementsByTagName('link');
+      for (var i = 0; i < links.length; i++) {
+        if (/(^|\s)stylesheet(\s|$)/i.test(links[i].getAttribute('rel') || '')) return true;
+      }
+    } catch (err) { /* 忽略 */ }
+    return false;
+  }
+
+  function schedule() {
+    if (document.readyState === 'complete' || !hasExternalCSS()) { boot(); return; }
+    var done = false;
+    window.addEventListener('load', function () { if (!done) { done = true; boot(); } });
+    // 兜底：外链 CSS 迟迟不 load 时也不让页面一直等
+    setTimeout(function () { if (!done) { done = true; boot(); } }, 400);
+  }
+
+  // 调试钩子：可在 devtools 控制台直接验证，例如
   // window.__mrHighlight('public class A {}', 'java')
   try {
-    window.__mrHighlight = highlight;
-    window.__mrDetectLang = detectLang;
+    window.__mrHighlight = function (c, l) { return HL.highlight ? HL.highlight(c, l) : esc(c); };
+    window.__mrDetectLang = function (c) { return HL.detectLang ? HL.detectLang(c, null) : null; };
+    window.__mrScore = function (c, el) { return scoreCode(el || document.body, c); };
   } catch (err) { /* 忽略 */ }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run);
+    document.addEventListener('DOMContentLoaded', schedule);
   } else {
-    run();
+    schedule();
   }
 })();

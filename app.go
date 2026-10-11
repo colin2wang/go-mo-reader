@@ -67,6 +67,19 @@ func (a *App) GetStartupFile() string {
 	return a.startupPath
 }
 
+// SetTheme 同步原生窗口（标题栏）主题，让夜间模式下窗口边框也跟着变暗。
+// 非 Windows 平台由 Wails 内部降级为空操作。
+func (a *App) SetTheme(dark bool) {
+	if a.ctx == nil {
+		return
+	}
+	if dark {
+		runtime.WindowSetDarkTheme(a.ctx)
+	} else {
+		runtime.WindowSetLightTheme(a.ctx)
+	}
+}
+
 // CloseBook 关闭并释放书籍内存
 func (a *App) CloseBook(id string) {
 	a.lib.Close(id)
